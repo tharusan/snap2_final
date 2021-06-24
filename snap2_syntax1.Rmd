@@ -1,0 +1,3197 @@
+---
+title: "Postoperative ICU admission on morbidity, length of stay and mortality"
+author: "Tharusan Thevathasan"
+date: "20 5 2020"
+output: html_document
+toc: true
+toc_depth: 3
+toc_float: true
+code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T,  message=F, warning=F, collapse = TRUE, error = TRUE)
+```
+
+# Getting started {.tabset}
+
+## Load libraries
+
+```{r, message=F, warning=F}
+library(dplyr)
+library(summarytools)
+library(tidyverse)
+library(DescTools)
+library(knitr)
+library(kableExtra)
+library(tableone)
+library(pander)
+library(sjPlot)
+library(broom)
+library(rms)
+library(Hmisc)
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+library("DiagrammeR")
+library(naniar)
+library(ivprobit)
+panderOptions('table.split.table', Inf)
+```
+
+## Load data and merge to one master dataset
+
+The occupancy data has information on number of empty beds, treated patients and dischargeable patients - each at 8AM and 8PM.
+
+```{r, message=F, warning=F}
+load("C:/Users/admin/Desktop/uclh/data/data/snap2_cleaning_tarush/data_clean/adjusted2/SNAP2_combined_clean_anonymised.Rdata")
+
+occupancy <- readRDS("C:/Users/admin/Desktop/uclh/data/data/snap2_cleaning_tarush/data_clean/adjusted2/occupancy_long_clean_combined.rds")
+patients_clean <- patients_clean %>% left_join(occupancy, by = c("SiteCode" = "SiteCode", "S02StudyDay" = "StudyDay"))
+
+library(readr)
+SNAP2_procedurelist_specialty_coded <- read_csv("SNAP2_procedurelist_specialty_coded.csv")
+procedures <- SNAP2_procedurelist_specialty_coded %>% select(Code, Specialty)
+patients_clean <- patients_clean %>% left_join(procedures, by = c("S02PlannedProcedure" = "Code"))
+rm(SNAP2_procedurelist_specialty_coded)
+```
+
+## Create variables
+
+- Create variable "EmptyBedsTimeofSurgery" which is the number of empty beds at the time of surgery.
+- Create variable "CCUCapacityTimeofSurgery" which is the sum out of empty beds and dischargeable patients at the time of surgery.
+- Create variable "TotalCapacityTimeofSurgery" which is the sum out of empty beds, dischargeable patients and treated patients at the time of surgery.
+- If surgery was performed between 8AM-4PM, ICU occupancy data from 8AM was used.
+- If surgery was performed between 8PM-4AM, ICU occupancy data from 8PM was used.
+
+
+```{r}
+patients_clean <- patients_clean %>%
+  mutate(CCUCapacityTimeofSurgery = 
+           ifelse(S02TimeOfSurgeryStartIncision %in% c("8", "12", "16"), 
+                  (EmptyBeds0800 + DischargeReady0800),
+                  ifelse(S02TimeOfSurgeryStartIncision %in% c("20"), 
+                         (EmptyBeds2000 + DischargeReady2000),
+                         ifelse(S02TimeOfSurgeryStartIncision %in% c("0", "4"),
+                                (EmptyBeds2000 + DischargeReady2000), NA)))) %>%
+  mutate(EmptyBedsTimeofSurgery = 
+           ifelse(S02TimeOfSurgeryStartIncision %in% c("8", "12", "16"), 
+                  EmptyBeds0800,
+                  ifelse(S02TimeOfSurgeryStartIncision %in% c("20"), 
+                         EmptyBeds2000,
+                         ifelse(S02TimeOfSurgeryStartIncision %in% c("0", "4"),
+                                EmptyBeds2000, NA)))) %>%
+  mutate(EmptyBedsTimeofSurgCat = ifelse(EmptyBedsTimeofSurgery == 0, 
+                                         "0",
+                                         ifelse(EmptyBedsTimeofSurgery == 1, 
+                                                "1",
+                                                ifelse(EmptyBedsTimeofSurgery > 1, 
+                                                       "2 or more", NA)))) %>%
+  mutate(TotalCapacityTimeofSurgery = 
+           ifelse(S02TimeOfSurgeryStartIncision %in% c("8", "12", "16"), 
+                  (TotalCapacity0800),
+                  ifelse(S02TimeOfSurgeryStartIncision %in% c("20"), 
+                         (TotalCapacity2000),
+                         ifelse(S02TimeOfSurgeryStartIncision %in% c("0", "4"),
+                                (TotalCapacity2000), NA))))
+```
+
+
+## Clean variables
+
+```{r}
+patients_clean <- patients_clean %>%  mutate_at(vars(S03RadiologicalFindings),
+                                                funs(recode_factor(.,
+                                                                   `Y` = TRUE,
+                                                                   `N` = FALSE,
+                                                                   `TRUE` = TRUE,
+                                                                   `FALSE` = FALSE)))
+
+patients_clean <- patients_clean %>% mutate(ecg = recode_factor(S03EcgFindings,
+                                                                `NOR` = "Normal",
+                                                                `ND` = "Not done",
+                                                                `4E` = "Abnormal",
+                                                                `AF>90` = "Abnormal",
+                                                                `AF6090` = "Abnormal",
+                                                                `O` = "Abnormal",
+                                                                `QW` = "Abnormal",
+                                                                `ST` = "Abnormal"))
+```
+
+
+# Inclusion and exclusion criteria {.tabset}
+
+## First surgery
+
+Include only **first surgery** during stay and store in patients_clean2.
+
+```{r}
+to_remove <- patients_clean %>% group_by(HashValue) %>% tally() %>%
+  filter(n > 1 & n < 98) %>% 
+  pull(HashValue)  #To make a tbl into a vector
+
+patients_clean$S02StudyDay <- factor(patients_clean$S02StudyDay, 
+                                     levels = c("Tue", "Wed", "Thu", "Fri", "Sat", "Sun", "Mon"), 
+                                     ordered = TRUE)
+
+to_remove <- patients_clean %>% filter(HashValue %in% to_remove) %>% 
+  group_by(HashValue) %>% 
+  arrange(S02StudyDay, S02TimeOfSurgeryStartIncision) %>%  #order by time (ascending)
+  select(HashValue, CaseId, SiteCode, S01Gender, S01Age, S02StudyDay, S02TimeOfSurgeryStartIncision) %>%
+  slice(2:3) %>%  #Take the 2nd and 3rd observations of each group (by HashValue)
+  select(CaseId) %>%
+  pull()
+
+patients_clean2 <- patients_clean %>% filter(!(CaseId %in% to_remove))
+
+```
+
+## Pre-op high acuity
+
+Exclude **level 2 and 3** (high acuity ward) prior to surgery and store in patients_clean3.
+
+```{r}
+patients_clean3 <- patients_clean2 %>% 
+  filter(!(S02PatientOrigin == "I" & S02LevelOfSupport == "3")) %>%
+  filter(!(S02LevelOfSupport %in% c("2", "3")))
+```
+
+## Complex procedures
+
+Exclude procedures with **absolute ICU indication** (e.g. aortic aneurysm repair, cardiac surgery, neuro-surgery) and store in patients_clean4.
+
+```{r}
+patients_clean4 <- patients_clean3 %>% 
+  filter(!(S02PlannedProcedureMainGroup == "6" & S02PlannedProcedureSubGroup %in% c("8", "9", "10"))) %>%
+  filter(!(S02PlannedProcedure %in% c("6-5-14-Com", "6-5-15-Com", "6-5-8-Com", "6-5-20-Com", "6-5-22-Com"))) %>%
+  filter(!(S02PlannedProcedureMainGroup == "7" & S02PlannedProcedureSubGroup %in% c("2", "4"))) %>%
+  filter(!(S02PlannedProcedure %in% c("9-6-45-Com" , "9-6-46-Com", "9-6-47-Com"))) %>%
+  filter(!(S02PlannedProcedureMainGroup == "14"))
+```
+
+
+The following procedures were not excluded based on our meeting discussion.
+```{r, eval=FALSE}
+#Low complex procedures with likely admisison to ward:
+filter(!(S02PlannedProcedureMainGroup == "1" & S02PlannedProcedureSubGroup %in% c("3", "4", "5", "6", "7", "8", "9"))) %>%
+  filter(!(S02PlannedProcedureMainGroup == "2" & S02PlannedProcedureSubGroup %in% c("8", "9", "10", "12"))) %>%
+  filter(!(S02PlannedProcedureMainGroup == "3" & S02PlannedProcedureSubGroup %in% c("8"))) %>%
+  filter(!(S02PlannedProcedure %in% c("5-1-1-Min", "5-1-2-Int", "5-1-5-Min"))) %>%
+  filter(!(S02PlannedProcedureMainGroup == "7" & S02PlannedProcedureSubGroup %in% c("7"))) %>%
+  filter(!(S02PlannedProcedureMainGroup == "8" & S02PlannedProcedureSubGroup %in% c("1"))) %>%
+  filter(!(S02PlannedProcedure %in% c("9-1-3-Maj" , "9-1-4-Int" , "9-1-13-Maj"))) %>%
+  filter(!(S02PlannedProcedureMainGroup == "12" & S02PlannedProcedureSubGroup %in% c("2"))) %>%
+  filter(!(S02PlannedProcedureMainGroup == "13" & S02PlannedProcedureSubGroup %in% c("8"))) %>%
+  filter(!(S02PlannedProcedureMainGroup == "15")) %>%
+  filter(!(S02PlannedProcedureMainGroup == "16"))
+
+#VATS lobectomy
+filter(!(S02PlannedProcedure %in% c("6-7-9-Maj", "6-7-11-Com", "6-7-12-Com"))) %>%
+
+```
+
+## Preop LOS
+
+Drop patients with **preoperative length of stay >7d** and store in patients_clean4.
+
+```{r}
+patients_clean4 <- patients_clean4 %>% filter(!(S02PreopLOS >7))
+```
+
+## Whole country?
+
+Shoul we drop a whole country based on occupancy data quality?
+Only **small fraction** (see ratio) of patients have missing occupancy data per country. Rather drop specific sites instead of whole country. NZ has no missing data.
+```{r}
+country_mis <- patients_clean4 %>% filter(is.na(CCUCapacityTimeofSurgery)) %>% group_by(country)  %>% summarise(mis=n())
+country_all <- patients_clean4 %>% group_by(country)  %>% summarise(all=n())
+country_drop <- merge(country_mis, country_all, by = "country")
+country_drop$ratio <- country_drop$mis / country_drop$all
+knitr::kable(country_drop, format = "markdown")
+```
+
+
+## Site occupancy data
+
+Drop **whole site** when the site has >20% cases with missing occupancy data at time of surgery out of all cases from this site.
+
+```{r}
+site_mis <- patients_clean4 %>% filter(is.na(CCUCapacityTimeofSurgery)) %>% group_by(SiteCode)  %>% summarise(mis=n()) #count missing cases per site
+site_all <- patients_clean4 %>% group_by(SiteCode)  %>% summarise(all=n()) #count number of total cases per site
+```
+
+Total number of cases per site and number of cases with missing occupancy data per site
+```{r}
+site_drop <- merge(site_mis, site_all, by = "SiteCode")
+site_drop$ratio_bed <- site_drop$mis / site_drop$all #build ratio out of missing cases per site / total cases per site
+site_drop <- site_drop %>% arrange(desc(ratio_bed))
+knitr::kable(site_drop, format = "markdown")
+```
+
+Ratio (cases with missing occupancy data / total cases per site) >20%
+```{r}
+site_drop2 <- site_drop %>% filter(ratio_bed >= 0.2)
+knitr::kable(site_drop2, format = "markdown")
+```
+
+Drop whole site when site has >20% missing cases
+```{r}
+patients_clean4 <- merge(patients_clean4, site_drop2, by="SiteCode", all = TRUE) #merge with main dataset. Sites which should be kept will get NA in "ratio_bed"
+patients_clean4 <- patients_clean4 %>% filter(is.na(ratio_bed)) #keep all cases with NA in ratio_bed
+```
+
+## Unplanned ICU admission
+
+Exclude patients with *unplannede ICU admisison*
+
+```{r}
+patients_clean4 <- patients_clean4 %>% filter(S07UnplannedPostoperativeIcuHduAdmissionAfterDayOfSurgery == "N")
+patients_clean4 <- patients_clean4 %>% filter(S07UnplannedDayOfSurgeryIcuHduPacuAdmission == "N")
+
+```
+
+
+# Study flow diagram
+
+
+```{r}
+data <- list(a= nrow(patients_clean), b= nrow(patients_clean2), c= nrow(patients_clean3),
+             d= nrow(patients_clean4), e= nrow(patients_clean5))
+
+
+DiagrammeR::grViz("
+digraph graph2 {
+
+graph [layout = dot]
+
+node [shape = rectangle, width = 4, fillcolor = Linen]
+a [label = '@@1']
+b [label = '@@2']
+c [label = '@@3']
+d [label = '@@4']
+e [label = '@@5']
+
+a -> b -> c -> d -> e
+
+}
+
+[1]:  paste0('Starting cohort (n = ', data$a, ')')
+[2]: paste0('Include only first surgery during hospital stay (n = ', data$b, ')')
+[3]: paste0('Exclude stay in high acuity ward prior to surgery (n = ', data$c, ')')
+[4]: paste0('Exclude procedures with absolute ICU indication or unplanned ICU admission, patients with preop. LOS >7d and sites with >20% missing occupancy data (n = ', data$d, ')')
+[5]: paste0('Exclude cases with missing values (n = ', data$e, ')')
+")
+```
+
+
+
+# Create treatment variable (ICU vs. Non-ICU) and outcome variables {.tabset}
+
+## Treatment
+
+**Treatment variable:**
+```{r}
+patients_clean4 <- patients_clean4 %>%
+  mutate(icu_adm = (S07PlannedDayOfSurgeryIcuHduPacuAdmission == "Y" | S07UnplannedDayOfSurgeryIcuHduPacuAdmission == "Y"))
+```
+
+## Outcome: POMS
+
+### Each POMS component
+
+The following POMS components exist in the dataset:
+
+- POMS_Cardio
+- POMS_Resp
+- POMS_Renal
+- POMS_Gastro
+- POMS_Inf
+- POMS_Neuro
+- POMS_Haem 
+- POMS_Wound
+
+### "ICU POMS"
+
+Build composite from cardio, pulmonary and renal - that is inherent to ICU:
+
+```{r}
+patients_clean4 <- patients_clean4 %>% mutate(poms_cardpulm = ifelse(POMS_Cardio == "TRUE" | POMS_Resp == "TRUE", 1, 0))
+
+patients_clean4 <- patients_clean4 %>% mutate(poms_cardpulmren = ifelse(POMS_Cardio == "TRUE" | POMS_Resp == "TRUE" | POMS_Renal == "TRUE", 1, 0))
+```
+
+### "Modified POMS" (not used anymore)
+
+Build our **poms_compos1** which includes procedures that are inherent to ICU and ward =  Inf + Gastro + Neuro + Haem + Wound + Pain:
+
+```{r}
+patients_clean4 <- patients_clean4 %>% mutate(poms_compos1 = ifelse(POMS_Inf == "TRUE" | POMS_Gastro == "TRUE" |
+                                                                      POMS_Neuro == "TRUE" | POMS_Haem == "TRUE" |
+                                                                      POMS_Wound == "TRUE" | POMS_Pain == "TRUE", 1, 0))
+```
+
+### POMS ordinal (not used)
+
+```{r}
+patients_clean4 <- patients_clean4 %>% mutate(cardio = ifelse(POMS_Cardio == "TRUE", 1, 0))
+patients_clean4 <- patients_clean4 %>% mutate(pulm = ifelse(POMS_Resp == "TRUE", 1, 0))
+patients_clean4 <- patients_clean4 %>% mutate(ren = ifelse(POMS_Renal == "TRUE", 1, 0))
+patients_clean4 <- patients_clean4 %>% mutate(inf = ifelse(POMS_Inf == "TRUE", 1, 0))
+patients_clean4 <- patients_clean4 %>% mutate(gast = ifelse(POMS_Gastro == "TRUE", 1, 0))
+patients_clean4 <- patients_clean4 %>% mutate(neuro = ifelse(POMS_Neuro == "TRUE", 1, 0))
+patients_clean4 <- patients_clean4 %>% mutate(haem = ifelse(POMS_Haem == "TRUE", 1, 0))
+patients_clean4 <- patients_clean4 %>% mutate(wound = ifelse(POMS_Wound == "TRUE", 1, 0))
+patients_clean4 <- patients_clean4 %>% mutate(pain = ifelse(POMS_Pain == "TRUE", 1, 0))
+
+patients_clean4 <- patients_clean4 %>% mutate(poms_ordinal = cardio + pulm + ren + inf + gast + neuro + haem + wound + pain)
+patients_clean4$poms_ordinal <- as.factor(patients_clean4$poms_ordinal)
+
+patients_clean4 <- patients_clean4 %>% mutate(poms_compos1_ord = inf + gast + neuro + haem + wound + pain)
+patients_clean4$poms_compos1_ord <- as.factor(patients_clean4$poms_compos1_ord)
+```
+
+## Outcome: Mortality
+
+Create mortality variable
+```{r}
+patients_clean4 <- patients_clean4 %>% mutate(S07StillInHospitalPrimaryAdmissionAfterSurgery = replace(S07StillInHospitalPrimaryAdmissionAfterSurgery,
+                                                                                                       which(is.na(S07StillInHospitalPrimaryAdmissionAfterSurgery) &
+                                                                                                               S05PatientStillAliveAndInHospital == "N"), "N")) %>%
+  mutate(S07StatusAtDischarge = replace(S07StatusAtDischarge, which(is.na(S07StatusAtDischarge) & S05StatusAtDischarge == "A"), "A")) %>%
+  mutate(S07StatusAtDischarge = replace(S07StatusAtDischarge, which(is.na(S07StatusAtDischarge) & S05StatusAtDischarge == "D"), "D")) %>%
+  mutate(postmort30 = (S07PostopLOS <= 30 & S07StatusAtDischarge == "D")) %>%
+  mutate(postmort30 = replace(postmort30, which(is.na(postmort30) & S07StillInHospitalPrimaryAdmissionAfterSurgery == "Y"), FALSE)) %>%
+  mutate(postmort60 = S07PostopLOS <= 60 & S07StatusAtDischarge == "D") %>%
+  mutate(postmort60 = replace(postmort60, which(is.na(postmort60) & S07StillInHospitalPrimaryAdmissionAfterSurgery == "Y"), FALSE))
+```
+
+
+# Confounders {.tabset}
+
+## Overview
+
+- Primary outcome: Modified POMS
+- Treatment: ICU yes/no
+
+1. Sex
+2. Age
+3. Patient origin: Home/Inaptient
+4. Procedure count: Number of procedures prior to intervention
+5. Urgency: emergent / expedited / immediate
+6. Procedural Severity
+7. ASA score
+8. General anesthesia: yes/no
+9. supplev_miss
+10. Preop LOS
+11. Malignancy
+12. Radiological finding
+13. CAD
+14. CHF
+15. Stroke
+16. Dementia
+17. COPD
+18. Pulmonary fibrosis
+19. Liver cirrhosis
+20. Renal disease
+21. Diabetes
+22. Polytrauma
+23. Preop GCS
+24. Systolic blood pressure
+25. Heart rate
+26. Dyspnea
+27. Night surgery: yes/no
+28. Anesthetist grade
+29. Surgeon grade
+(30. Instrument: ICU occupancy)
+
+The following confounders are not included based on our meeting discussion:
+
+- ECG: unreliable
+- SORT Mortality: 30-day mortality risk by perop team already included. SORT components are already used as seprate confounders.
+- POSSUM Mortality: 30-day mortality risk by perop team already included. 
+
+
+## Missing values
+
+```{r}
+final_dataset <- patients_clean4 %>% select(POMS, icu_adm, S01Gender, S01Age, S02PatientOrigin,
+                                            S04ProcedureCount, S02OperativeUrgency, S02PlannedProcSeverity,
+                                            S03AsaPsClass, S04AnaestheticTechniqueGeneral,
+                                            S02LevelOfSupport, S02PreopLOS, S04Malignancy,
+                                            S03RadiologicalFindings,
+                                            S03PastMedicalHistoryCoronaryArteryDisease,
+                                            S03PastMedicalHistoryCongestiveCardiacFailure,
+                                            S03PastMedicalHistoryStrokeTIA, S03PastMedicalHistoryDementia,
+                                            S03PastMedicalHistoryCOPD,
+                                            S03PastMedicalHistoryPulmonaryFibrosis,
+                                            S03PastMedicalHistoryLiverCirrhosis,
+                                            S03PastMedicalHistoryRenalDisease, S03Diabetes,
+                                            S03PastMedicalHistoryComplexPolytrauma,
+                                            S03GlasgowComaScaleGcsPreInductionOfAnaesthesia,
+                                            S03SystolicBloodPressureBpAtPreAssessment,
+                                            S03PulseRateAtPreoperativeAssessment, S03Dyspnoea,
+                                            S02TimeOfSurgeryStartIncision,
+                                            S03GradeOfMostSeniorAnaesthetistPresent,
+                                            S03GradeOfMostSeniorSurgeonPresent, CCUCapacityTimeofSurgery)
+
+```
+
+**Number of missing values in our primary model**
+
+```{r}
+gg_miss_var(final_dataset)
+```
+
+**Number of missing values per case**
+
+```{r}
+gg_miss_case(final_dataset)
+```
+
+**Looking into each variable separately**
+
+- Primary outcomes: POMS
+```{r}
+sum(is.na(patients_clean4$poms_compos1))
+poms_mis <- which(!complete.cases(patients_clean4$poms_compos1))
+```
+
+- Treatment: ICU yes/no
+```{r}
+sum(is.na(patients_clean4$icu_adm))
+icu_mis <- which(!complete.cases(patients_clean4$icu_adm))
+```
+
+
+
+1. Sex
+```{r}
+patients_clean4$S01Gender <- as.factor(patients_clean4$S01Gender)
+patients_clean4 %>% group_by(S01Gender)  %>% summarise(freq=n())
+sum(is.na(patients_clean4$S01Gender))
+gender_mis <- which(!complete.cases(patients_clean4$S01Gender)) #Select all missing values in gender
+```
+
+2. Age
+```{r}
+patients_clean4$age <- as.integer(patients_clean4$S01Age)
+summary(patients_clean4$age) #No extremes
+sum(is.na(patients_clean4$age)) #No missing values
+age_mis <- which(!complete.cases(patients_clean4$age))
+```
+
+3. Patient origin: Home/Inaptient
+```{r}
+patients_clean4$S02PatientOrigin <- as.factor(patients_clean4$S02PatientOrigin)
+sum(is.na(patients_clean4$S02PatientOrigin))
+ptorigin_mis <- which(!complete.cases(patients_clean4$S02PatientOrigin))
+```
+
+4. Procedure count: Number of procedures prior to intervention
+```{r}
+sum(is.na(patients_clean4$S04ProcedureCount))
+proccount_miss <- which(!complete.cases(patients_clean4$S04ProcedureCount))
+```
+
+5. Urgency: emergent / expedited / immediate
+```{r}
+patients_clean4$S02OperativeUrgency <- as.factor(patients_clean4$S02OperativeUrgency)
+sum(is.na(patients_clean4$S02OperativeUrgency))
+urgency_mis <- which(!complete.cases(patients_clean4$S02OperativeUrgency))
+```
+
+6. Procedural Severity
+```{r}
+sum(is.na(patients_clean4$S02PlannedProcSeverity))
+procseverity_miss <- which(!complete.cases(patients_clean4$S02PlannedProcSeverity))
+```
+
+7. ASA score
+```{r}
+patients_clean4$S03AsaPsClass <- as.factor(patients_clean4$S03AsaPsClass)
+sum(is.na(patients_clean4$S03AsaPsClass))
+asa_miss <- which(!complete.cases(patients_clean4$S03AsaPsClass)) #recat to low, medium, high later
+```
+
+8. General anesthesia: yes/no
+```{r}
+sum(is.na(patients_clean4$S04AnaestheticTechniqueGeneral))
+ga_miss <- which(!complete.cases(patients_clean4$S04AnaestheticTechniqueGeneral))
+```
+
+9. Level of support
+```{r}
+sum(is.na(patients_clean4$S02LevelOfSupport))
+supplev_miss <- which(!complete.cases(patients_clean4$S02LevelOfSupport))
+```
+
+10. Preop LOS
+```{r}
+sum(is.na(patients_clean4$S02PreopLOS))
+preoplos_miss <- which(!complete.cases(patients_clean4$S02PreopLOS))
+```
+
+11. Malignancy
+```{r}
+sum(is.na(patients_clean4$S04Malignancy)) #recat to binary later
+malign_miss <- which(!complete.cases(patients_clean4$S04Malignancy))
+```
+
+12. Radiological finding
+```{r}
+sum(is.na(patients_clean4$S03RadiologicalFindings)) #recat later to 0=false, 1=true
+radio_miss <- which(!complete.cases(patients_clean4$S03RadiologicalFindings))
+```
+
+13. CAD
+```{r}
+sum(is.na(patients_clean4$S03PastMedicalHistoryCoronaryArteryDisease))
+patients_clean4$S03PastMedicalHistoryCoronaryArteryDisease <- as.factor(patients_clean4$S03PastMedicalHistoryCoronaryArteryDisease)
+cad_miss <- which(!complete.cases(patients_clean4$S03PastMedicalHistoryCoronaryArteryDisease)) #recat later 0=false, 1=true
+```
+
+14. CHF
+```{r}
+sum(is.na(patients_clean4$S03PastMedicalHistoryCongestiveCardiacFailure))
+patients_clean4$S03PastMedicalHistoryCongestiveCardiacFailure <- as.factor(patients_clean4$S03PastMedicalHistoryCongestiveCardiacFailure)
+chf_miss <- which(!complete.cases(patients_clean4$S03PastMedicalHistoryCongestiveCardiacFailure)) #recat later 0=false, 1=true
+```
+
+15. Stroke
+```{r}
+sum(is.na(patients_clean4$S03PastMedicalHistoryStrokeTIA))
+patients_clean4$S03PastMedicalHistoryStrokeTIA <- as.factor(patients_clean4$S03PastMedicalHistoryStrokeTIA)
+stroke_miss <- which(!complete.cases(patients_clean4$S03PastMedicalHistoryStrokeTIA)) #recat later 0=false, 1=true
+```
+
+16. Dementia
+```{r}
+sum(is.na(patients_clean4$S03PastMedicalHistoryDementia))
+patients_clean4$S03PastMedicalHistoryDementia <- as.factor(patients_clean4$S03PastMedicalHistoryDementia)
+demen_miss <- which(!complete.cases(patients_clean4$S03PastMedicalHistoryDementia)) #recat later 0=false, 1=true
+```
+
+17. COPD
+```{r}
+sum(is.na(patients_clean4$S03PastMedicalHistoryCOPD))
+patients_clean4$S03PastMedicalHistoryCOPD <- as.factor(patients_clean4$S03PastMedicalHistoryCOPD)
+copd_miss <- which(!complete.cases(patients_clean4$S03PastMedicalHistoryCOPD)) #recat later 0=false, 1=true
+```
+
+18. Pulmonary fibrosis
+```{r}
+sum(is.na(patients_clean4$S03PastMedicalHistoryPulmonaryFibrosis))
+patients_clean4$S03PastMedicalHistoryPulmonaryFibrosis <- as.factor(patients_clean4$S03PastMedicalHistoryPulmonaryFibrosis)
+pulmfibr_miss <- which(!complete.cases(patients_clean4$S03PastMedicalHistoryPulmonaryFibrosis)) #recat later 0=false, 1=true
+```
+
+19. Liver cirrhosis
+```{r}
+sum(is.na(patients_clean4$S03PastMedicalHistoryLiverCirrhosis))
+patients_clean4$S03PastMedicalHistoryLiverCirrhosis <- as.factor(patients_clean4$S03PastMedicalHistoryLiverCirrhosis)
+livcirr_miss <- which(!complete.cases(patients_clean4$S03PastMedicalHistoryLiverCirrhosis)) #recat later 0=false, 1=true
+```
+
+20. Renal disease
+```{r}
+sum(is.na(patients_clean4$S03PastMedicalHistoryRenalDisease))
+patients_clean4$S03PastMedicalHistoryRenalDisease <- as.factor(patients_clean4$S03PastMedicalHistoryRenalDisease)
+ren_miss <- which(!complete.cases(patients_clean4$S03PastMedicalHistoryRenalDisease)) #recat later 0=false, 1=true
+```
+
+21. Diabetes
+```{r}
+sum(is.na(patients_clean4$S03Diabetes))
+diab_miss <- which(!complete.cases(patients_clean4$S03Diabetes)) #recat later 0=false, 1=true
+```
+
+22. Polytrauma
+```{r}
+sum(is.na(patients_clean4$S03PastMedicalHistoryComplexPolytrauma))
+patients_clean4$S03PastMedicalHistoryComplexPolytrauma <- as.factor(patients_clean4$S03PastMedicalHistoryComplexPolytrauma)
+polytr_miss <- which(!complete.cases(patients_clean4$S03PastMedicalHistoryComplexPolytrauma)) #recat later 0=false, 1=true
+```
+
+23. Preop GCS
+```{r}
+sum(is.na(patients_clean4$S03GlasgowComaScaleGcsPreInductionOfAnaesthesia))
+preopGCS_miss <- which(!complete.cases(patients_clean4$S03GlasgowComaScaleGcsPreInductionOfAnaesthesia))
+```
+
+24. Systolic blood pressure
+```{r}
+sum(is.na(patients_clean4$S03SystolicBloodPressureBpAtPreAssessment))
+sbp_miss <- which(!complete.cases(patients_clean4$S03SystolicBloodPressureBpAtPreAssessment))
+```
+
+25. Heart rate
+```{r}
+sum(is.na(patients_clean4$S03PulseRateAtPreoperativeAssessment))
+hr_miss <- which(!complete.cases(patients_clean4$S03PulseRateAtPreoperativeAssessment))
+```
+
+26. Dyspnea
+```{r}
+sum(is.na(patients_clean4$S03Dyspnoea))
+dyspnea_miss <- which(!complete.cases(patients_clean4$S03Dyspnoea)) #recat later
+```
+
+27. Night surgery: yes/no
+```{r}
+sum(is.na(patients_clean4$S02TimeOfSurgeryStartIncision))
+night_miss <- which(!complete.cases(patients_clean4$S02TimeOfSurgeryStartIncision)) #recat later to binary night vs. day
+```
+
+28. Anesthetist grade
+```{r}
+sum(is.na(patients_clean4$S03GradeOfMostSeniorAnaesthetistPresent))
+anesgrade_miss <- which(!complete.cases(patients_clean4$S03GradeOfMostSeniorAnaesthetistPresent)) #recat later based on expert grade
+```
+
+29. Surgeon grade
+```{r}
+sum(is.na(patients_clean4$S03GradeOfMostSeniorSurgeonPresent))
+surggrade_miss <- which(!complete.cases(patients_clean4$S03GradeOfMostSeniorSurgeonPresent)) #recat later based on expert grade
+
+```
+
+(30. Instrument: ICU occupancy)
+```{r}
+sum(is.na(patients_clean4$CCUCapacityTimeofSurgery))
+occu_miss <- which(!complete.cases(patients_clean4$CCUCapacityTimeofSurgery))
+```
+
+Not used anymore based on discussion (see above):
+```{r, eval=FALSE}
+ecg_miss <- which(!complete.cases(patients_clean4$ecg))
+sort_miss <- which(!complete.cases(patients_clean4$SORT_mort))
+possum_miss <- which(!complete.cases(patients_clean4$pPOSSUM_mort))
+
+```
+
+Drop patients with missing values and store in patients_clean5.
+```{r}
+patients_clean5 <- patients_clean4[c(-poms_mis, -icu_mis, -gender_mis, -age_mis, -ptorigin_mis, -proccount_miss,
+                                     -urgency_mis, -procseverity_miss, -asa_miss, -ga_miss, -supplev_miss, -preoplos_miss,
+                                     - malign_miss, -radio_miss, -cad_miss, -chf_miss, -stroke_miss, -demen_miss,
+                                     -copd_miss, -pulmfibr_miss, -livcirr_miss, -ren_miss, -diab_miss, -polytr_miss,
+                                     -preopGCS_miss, -sbp_miss, -hr_miss, -dyspnea_miss, -night_miss,
+                                     - anesgrade_miss, -surggrade_miss, -occu_miss
+                                      ), ]
+```
+
+                                    
+
+- Treatment: ICU yes/no
+
+```{r}
+xtabs (~ POMS + icu_adm, data = patients_clean5)
+```
+
+1. Sex
+```{r}
+xtabs(~ POMS + S01Gender, data = patients_clean5)
+```
+
+2. Age
+```{r}
+qplot(patients_clean5$age, geom = "histogram", binwidth = 2) #consider recategorization
+summary(patients_clean5$age)
+
+#quintiles
+patients_clean5$age_p20 <- as.ordered(cut2(patients_clean5$age, g=5))
+xtabs(~ POMS + age_p20, data = patients_clean5)
+```
+
+3. Patient origin: Home/Inaptient
+```{r}
+xtabs(~ POMS + S02PatientOrigin, data = patients_clean5)
+```
+
+4. Procedure count: Number of procedures prior to intervention
+```{r}
+xtabs(~ POMS + S04ProcedureCount, data = patients_clean5)
+```
+
+5. Urgency: emergent / expedited / immediate
+```{r}
+xtabs(~ POMS + S02OperativeUrgency, data = patients_clean5)
+
+patients_clean5$urg[patients_clean5$S02OperativeUrgency == "Ele"] <- 0
+patients_clean5$urg[patients_clean5$S02OperativeUrgency == "Exp"] <- 1
+patients_clean5$urg[patients_clean5$S02OperativeUrgency == "U"] <- 2
+patients_clean5$urg[patients_clean5$S02OperativeUrgency == "I"] <- 3
+patients_clean5$urg <- as.ordered(patients_clean5$urg)
+xtabs (~ POMS+ urg, data = patients_clean5)
+```
+
+6. Procedural Severity
+```{r}
+xtabs(~ POMS + S02PlannedProcSeverity, data = patients_clean5)
+```
+
+7. ASA score
+```{r}
+xtabs(~ poms_compos1 + S03AsaPsClass, data = patients_clean5) #few patients with ASA5 - consider recategorization
+
+#ASA high, medium and low
+patients_clean5$asa[patients_clean5$S03AsaPsClass == "IV" | patients_clean5$S03AsaPsClass == "V"] <- 2
+patients_clean5$asa[patients_clean5$S03AsaPsClass == "III"] <- 1
+patients_clean5$asa[patients_clean5$S03AsaPsClass == "I" | patients_clean5$S03AsaPsClass == "II"] <- 0
+patients_clean5$asa <- as.ordered(patients_clean5$asa)
+xtabs(~ POMS + asa, data = patients_clean5)
+```
+
+8. General anesthesia: yes/no
+```{r}
+xtabs(~ POMS + S04AnaestheticTechniqueGeneral, data = patients_clean5)
+```
+
+9. Level of support
+```{r}
+xtabs(~ POMS + S02LevelOfSupport, data = patients_clean5)
+```
+
+10. Preop LOS
+```{r}
+qplot(patients_clean5$S02PreopLOS, geom = "histogram", binwidth = 1)
+summary(patients_clean5$S02PreopLOS)
+```
+
+11. Malignancy
+```{r}
+xtabs(~ poms_compos1 + S04Malignancy, data = patients_clean5)
+
+patients_clean5$malig[patients_clean5$S04Malignancy == "MDM"] <- 1
+patients_clean5$malig[patients_clean5$S04Malignancy == "MNM"] <- 1
+patients_clean5$malig[patients_clean5$S04Malignancy == "PM"] <- 1
+patients_clean5$malig[patients_clean5$S04Malignancy == "NM"] <- 0
+patients_clean5$malig <- as.factor(patients_clean5$malig)
+xtabs (~ POMS + malig, data = patients_clean5)
+```
+
+12. Radiological finding
+```{r}
+xtabs(~ poms_compos1 + S03RadiologicalFindings, data = patients_clean5)
+
+patients_clean5$radio[patients_clean5$S03RadiologicalFindings == "TRUE"] <- 1
+patients_clean5$radio[patients_clean5$S03RadiologicalFindings == "FALSE"] <- 0
+patients_clean5$radio <- as.factor(patients_clean5$radio)
+xtabs (~ POMS + radio, data = patients_clean5)
+```
+
+13. CAD
+```{r}
+xtabs(~ poms_compos1 + S03PastMedicalHistoryCoronaryArteryDisease, data = patients_clean5)
+
+patients_clean5$cad[patients_clean5$S03PastMedicalHistoryCoronaryArteryDisease == "Y"] <- 1
+patients_clean5$cad[patients_clean5$S03PastMedicalHistoryCoronaryArteryDisease == "N"] <- 0
+patients_clean5$cad <- as.factor(patients_clean5$cad)
+xtabs (~ POMS + cad, data = patients_clean5)
+```
+
+14. CHF
+```{r}
+xtabs(~ poms_compos1 + S03PastMedicalHistoryCongestiveCardiacFailure, data = patients_clean5)
+
+patients_clean5$chf[patients_clean5$S03PastMedicalHistoryCongestiveCardiacFailure == "Y"] <- 1
+patients_clean5$chf[patients_clean5$S03PastMedicalHistoryCongestiveCardiacFailure == "N"] <- 0
+patients_clean5$chf <- as.factor(patients_clean5$chf)
+xtabs (~ POMS + chf, data = patients_clean5)
+```
+
+15. Stroke
+```{r}
+xtabs(~ poms_compos1 + S03PastMedicalHistoryStrokeTIA, data = patients_clean5)
+
+patients_clean5$stroke[patients_clean5$S03PastMedicalHistoryStrokeTIA == "Y"] <- 1
+patients_clean5$stroke[patients_clean5$S03PastMedicalHistoryStrokeTIA == "N"] <- 0
+patients_clean5$stroke <- as.factor(patients_clean5$stroke)
+xtabs (~ POMS + stroke, data = patients_clean5)
+```
+
+16. Dementia
+```{r}
+xtabs(~ poms_compos1 + S03PastMedicalHistoryDementia, data = patients_clean5)
+
+patients_clean5$demen[patients_clean5$S03PastMedicalHistoryDementia == "Y"] <- 1
+patients_clean5$demen[patients_clean5$S03PastMedicalHistoryDementia == "N"] <- 0
+patients_clean5$demen <- as.factor(patients_clean5$demen)
+xtabs (~ POMS + demen, data = patients_clean5)
+```
+
+17. COPD
+```{r}
+xtabs(~ poms_compos1 + S03PastMedicalHistoryCOPD, data = patients_clean5)
+
+patients_clean5$copd[patients_clean5$S03PastMedicalHistoryCOPD == "Y"] <- 1
+patients_clean5$copd[patients_clean5$S03PastMedicalHistoryCOPD == "N"] <- 0
+patients_clean5$copd <- as.factor(patients_clean5$copd)
+xtabs (~ POMS + copd, data = patients_clean5)
+```
+
+18. Pulmonary fibrosis
+```{r}
+xtabs(~ poms_compos1 + S03PastMedicalHistoryPulmonaryFibrosis, data = patients_clean5)
+
+patients_clean5$pulfib[patients_clean5$S03PastMedicalHistoryPulmonaryFibrosis == "Y"] <- 1
+patients_clean5$pulfib[patients_clean5$S03PastMedicalHistoryPulmonaryFibrosis == "N"] <- 0
+patients_clean5$pulfib <- as.factor(patients_clean5$pulfib)
+xtabs (~ POMS + pulfib, data = patients_clean5)
+```
+
+19. Liver cirrhosis
+```{r}
+xtabs(~ poms_compos1 + S03PastMedicalHistoryLiverCirrhosis, data = patients_clean5)
+
+patients_clean5$livcirr[patients_clean5$S03PastMedicalHistoryLiverCirrhosis == "Y"] <- 1
+patients_clean5$livcirr[patients_clean5$S03PastMedicalHistoryLiverCirrhosis == "N"] <- 0
+patients_clean5$livcirr <- as.factor(patients_clean5$livcirr)
+xtabs (~ POMS + livcirr, data = patients_clean5)
+```
+
+20. Renal disease
+```{r}
+xtabs(~ poms_compos1 + S03PastMedicalHistoryRenalDisease, data = patients_clean5)
+
+patients_clean5$rend[patients_clean5$S03PastMedicalHistoryRenalDisease == "Y"] <- 1
+patients_clean5$rend[patients_clean5$S03PastMedicalHistoryRenalDisease == "N"] <- 0
+patients_clean5$rend <- as.factor(patients_clean5$rend)
+xtabs (~ POMS + rend, data = patients_clean5)
+```
+
+21. Diabetes
+```{r}
+xtabs(~ poms_compos1 + S03Diabetes, data = patients_clean5) #recategorize in yes/no
+
+#Diabetes yes/no
+patients_clean5$diabetfac <- as.factor(patients_clean5$S03Diabetes)
+patients_clean5 <- patients_clean5 %>% mutate(diabet = ifelse(diabetfac == "1" | diabetfac == "2D" | diabetfac == "2I" | diabetfac == "2O", 1, 0))
+patients_clean5$diabet <- as.factor(patients_clean5$diabet)
+xtabs(~ POMS + diabet, data = patients_clean5)
+```
+
+22. Polytrauma
+```{r}
+xtabs(~ poms_compos1 + S03PastMedicalHistoryComplexPolytrauma, data = patients_clean5)
+
+patients_clean5$polytr[patients_clean5$S03PastMedicalHistoryComplexPolytrauma == "Y"] <- 1
+patients_clean5$polytr[patients_clean5$S03PastMedicalHistoryComplexPolytrauma == "N"] <- 0
+patients_clean5$polytr <- as.factor(patients_clean5$polytr)
+xtabs (~ POMS + polytr, data = patients_clean5)
+```
+
+23. Preop GCS
+```{r}
+xtabs(~ poms_compos1 + S03GlasgowComaScaleGcsPreInductionOfAnaesthesia, data = patients_clean5) #recategorize in above and below 8
+
+#GCS low or high
+patients_clean5 <- patients_clean5 %>% mutate(gcs_low = ifelse(S03GlasgowComaScaleGcsPreInductionOfAnaesthesia <= 8, 1, 0))
+patients_clean5$gcs_low <- as.factor(patients_clean5$gcs_low)
+xtabs(~ POMS + gcs_low, data = patients_clean5)
+
+```
+
+24. Systolic blood pressure
+```{r}
+qplot(patients_clean5$S03SystolicBloodPressureBpAtPreAssessment, geom = "histogram", binwidth = 2)
+summary(patients_clean5$S03SystolicBloodPressureBpAtPreAssessment)
+```
+
+25. Heart rate
+```{r}
+qplot(patients_clean5$S03PulseRateAtPreoperativeAssessment, geom = "histogram", binwidth = 2)
+summary(patients_clean5$S03PulseRateAtPreoperativeAssessment)
+```
+
+26. Dyspnea
+```{r}
+xtabs(~ POMS + S03Dyspnoea, data = patients_clean5)
+
+patients_clean5$dyspn[patients_clean5$S03Dyspnoea == "Non"] <- 0
+patients_clean5$dyspn[patients_clean5$S03Dyspnoea == "OME"] <- 1
+patients_clean5$dyspn[patients_clean5$S03Dyspnoea == "L"] <- 2
+patients_clean5$dyspn[patients_clean5$S03Dyspnoea == "AR"] <- 2
+patients_clean5$dyspn <- as.ordered(patients_clean5$dyspn)
+xtabs (~ POMS + dyspn, data = patients_clean5)
+```
+
+27. Night surgery: yes/no
+```{r}
+patients_clean5$night[patients_clean5$S02TimeOfSurgeryStartIncision == 20] <- 1
+patients_clean5$night[patients_clean5$S02TimeOfSurgeryStartIncision == 0] <- 1
+patients_clean5$night[patients_clean5$S02TimeOfSurgeryStartIncision == 4] <- 1
+patients_clean5$night[patients_clean5$S02TimeOfSurgeryStartIncision == 8] <- 0
+patients_clean5$night[patients_clean5$S02TimeOfSurgeryStartIncision == 12] <- 0
+patients_clean5$night[patients_clean5$S02TimeOfSurgeryStartIncision == 16] <- 0
+patients_clean5$night <- as.factor(patients_clean5$night)
+xtabs (~ POMS + night, data = patients_clean5)
+```
+
+28. Anesthetist grade
+```{r}
+patients_clean5$anesgrade[patients_clean5$S03GradeOfMostSeniorAnaesthetistPresent == "Con"] <- 1
+patients_clean5$anesgrade[patients_clean5$S03GradeOfMostSeniorAnaesthetistPresent == "AS"] <- 1
+patients_clean5$anesgrade[patients_clean5$S03GradeOfMostSeniorAnaesthetistPresent == "ST3"] <- 2
+patients_clean5$anesgrade[patients_clean5$S03GradeOfMostSeniorAnaesthetistPresent == "SR"] <- 2
+patients_clean5$anesgrade[patients_clean5$S03GradeOfMostSeniorAnaesthetistPresent == "FEL"] <- 2
+patients_clean5$anesgrade[patients_clean5$S03GradeOfMostSeniorAnaesthetistPresent == "CFT"] <- 3
+patients_clean5$anesgrade[patients_clean5$S03GradeOfMostSeniorAnaesthetistPresent == "JR"] <- 3
+patients_clean5$anesgrade <- as.factor(patients_clean5$anesgrade)
+xtabs (~ POMS + anesgrade, data = patients_clean5)
+```
+
+29. Surgeon grade
+```{r}
+patients_clean5$surgrade[patients_clean5$S03GradeOfMostSeniorSurgeonPresent == "Con"] <- 1
+patients_clean5$surgrade[patients_clean5$S03GradeOfMostSeniorSurgeonPresent == "AS"] <- 1
+patients_clean5$surgrade[patients_clean5$S03GradeOfMostSeniorSurgeonPresent == "ST3"] <- 2
+patients_clean5$surgrade[patients_clean5$S03GradeOfMostSeniorSurgeonPresent == "SR"] <- 2
+patients_clean5$surgrade[patients_clean5$S03GradeOfMostSeniorSurgeonPresent == "FEL"] <- 2
+patients_clean5$surgrade[patients_clean5$S03GradeOfMostSeniorSurgeonPresent == "CFT"] <- 3
+patients_clean5$surgrade[patients_clean5$S03GradeOfMostSeniorSurgeonPresent == "JR"] <- 3
+patients_clean5$surgrade <- as.factor(patients_clean5$surgrade)
+xtabs (~ POMS + surgrade, data = patients_clean5)
+```
+
+
+
+# Unadjusted analyses {.tabset}
+
+## Primary outcome: POMS
+```{r, results=TRUE}
+poms_unadj <- glm(POMS ~ icu_adm,
+                           data = patients_clean5,
+                           family = "binomial")
+
+tab_model(poms_unadj, transform = NULL)
+```
+
+## Primary outcomes: Mortality (and LOS)
+
+###Mortality
+
+```{r}
+postmort30_unadj <- glm(postmort30 ~ icu_adm,
+                          data = patients_clean5,
+                          family = "binomial")
+
+postmort60_unadj <- glm(postmort60 ~ icu_adm,
+                        data = patients_clean5,
+                        family = "binomial")
+
+tab_model(postmort30_unadj, postmort60_unadj, transform = NULL)
+```
+
+### LOS
+
+```{r}
+library(MASS)
+library(magrittr)
+los_unadj <- glm.nb(S07PostopLOS ~ icu_adm, data = patients_clean5)
+```
+
+
+## Exploratory outcomes
+
+### Each POMS component
+
+```{r}
+poms_cardio_unadj <- glm(POMS_Cardio ~ icu_adm,
+                  data = patients_clean5,
+                  family = "binomial")
+
+poms_resp_unadj <- glm(POMS_Resp ~ icu_adm,
+                  data = patients_clean5,
+                  family = "binomial")
+
+poms_renal_unadj <- glm(POMS_Renal ~ icu_adm,
+                       data = patients_clean5,
+                       family = "binomial")
+
+poms_gastro_unadj <- glm(POMS_Gastro ~ icu_adm,
+                       data = patients_clean5,
+                       family = "binomial")
+
+poms_inf_unadj <- glm(POMS_Inf ~ icu_adm,
+                       data = patients_clean5,
+                       family = "binomial")
+
+poms_neuro_unadj <- glm(POMS_Neuro ~ icu_adm,
+                       data = patients_clean5,
+                       family = "binomial")
+
+poms_haem_unadj <- glm(POMS_Haem ~ icu_adm,
+                       data = patients_clean5,
+                       family = "binomial")
+
+poms_wound_unadj <- glm(POMS_Wound ~ icu_adm,
+                       data = patients_clean5,
+                       family = "binomial")
+
+poms_pain_unadj <- glm(POMS_Pain ~ icu_adm,
+                       data = patients_clean5,
+                       family = "binomial")
+
+```
+
+### "ICU POMS"
+
+```{r}
+poms_cardpulm_unadj <- glm(poms_cardpulm ~ icu_adm,
+                       data = patients_clean5,
+                       family = "binomial")
+
+poms_cardpulmren_unadj <- glm(poms_cardpulmren ~ icu_adm,
+                           data = patients_clean5,
+                           family = "binomial")
+```
+
+### POMS ordinal
+
+```{r, eval=FALSE}
+library(MASS)
+
+#Ordinal regression 1
+ord_log_poms_compos1_unadj <- polr(poms_compos1_ord ~ icu_adm, data = patients_clean5, Hess=TRUE)
+
+summary(ord_log_poms_compos1_unadj)
+ctable_pomsordinal2 <- coef(summary(ord_log_poms_compos1_unadj))
+ctable_pomsordinal_p2 <- pnorm(abs(ctable_pomsordinal2[, "t value"]), lower.tail = FALSE) * 2
+ctable_pomsordinal2 <- cbind(ctable_pomsordinal2, "p value" = ctable_pomsordinal_p2)
+ctable_pomsordinal2
+
+ci_pomsordinal2 <- confint(ord_log_poms_compos1_unadj)
+exp(coef(ord_log_poms_compos1_unadj))
+exp(cbind(OR = coef(ord_log_poms_compos1_unadj), ci_pomsordinal2))
+
+
+#Oridnal regression 2
+ord_log_poms_unadj <- polr(poms_ordinal ~ icu_adm, data = patients_clean5, Hess=TRUE)
+
+summary(ord_log_poms_unadj)
+ctable_pomsordinal <- coef(summary(ord_log_poms_unadj))
+ctable_pomsordinal_p <- pnorm(abs(ctable_pomsordinal[, "t value"]), lower.tail = FALSE) * 2
+ctable_pomsordinal <- cbind(ctable_pomsordinal, "p value" = ctable_pomsordinal_p)
+ctable_pomsordinal
+
+ci_pomsordinal <- confint(ord_log_poms_unadj)
+exp(coef(ord_log_poms_unadj))
+exp(cbind(OR = coef(ord_log_poms_unadj), ci_pomsordinal))
+```
+
+
+## All Results
+
+### Primary and secondary outcomes
+```{r, eval=FALSE}
+exp(cbind(OR = coef(poms_unadj), confint(poms_unadj)))
+exp(cbind(OR = coef(postmort30_unadj), confint(postmort30_unadj)))
+exp(cbind(OR = coef(postmort60_unadj), confint(postmort60_unadj)))
+exp(cbind(OR = coef(los_unadj), confint(los_unadj)))
+```
+
+```{r}
+tab_model(postmort30_unadj, postmort60_unadj, poms_unadj, transform = NULL)
+```
+
+### Exploratory outcomes
+
+```{r, eval=FALSE}
+exp(cbind(OR = coef(poms_cardio_unadj), confint(poms_cardio_unadj)))
+exp(cbind(OR = coef(poms_resp_unadj), confint(poms_resp_unadj)))
+exp(cbind(OR = coef(poms_renal_unadj), confint(poms_renal_unadj)))
+exp(cbind(OR = coef(poms_gastro_unadj), confint(poms_gastro_unadj)))
+exp(cbind(OR = coef(poms_inf_unadj), confint(poms_inf_unadj)))
+exp(cbind(OR = coef(poms_neuro_unadj), confint(poms_neuro_unadj)))
+exp(cbind(OR = coef(poms_haem_unadj), confint(poms_haem_unadj)))
+exp(cbind(OR = coef(poms_wound_unadj), confint(poms_wound_unadj)))
+exp(cbind(OR = coef(poms_pain_unadj), confint(poms_pain_unadj)))
+
+exp(cbind(OR = coef(poms_cardpulm_unadj), confint(poms_cardpulm_unadj)))
+exp(cbind(OR = coef(poms_cardpulmren_unadj), confint(poms_cardpulmren_unadj)))
+
+#Results of ordinal outcomes see above
+```
+
+**Each POMS component**
+```{r}
+tab_model(poms_cardio_unadj, poms_resp_unadj, poms_renal_unadj, poms_gastro_unadj,
+          poms_inf_unadj, poms_neuro_unadj, poms_haem_unadj, poms_wound_unadj,
+          poms_pain_unadj, transform = NULL)
+```
+
+**"ICU POMS"**
+```{r}
+tab_model(poms_cardpulm_unadj, poms_cardpulmren_unadj, transform = NULL)
+```
+
+
+# Adjusted analyses {.tabset}
+
+## Primary outcome: POMS
+
+### POMS
+
+```{r}
+log_poms <- glm(POMS ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                          S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                  malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                  S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                  night + anesgrade + surgrade,
+                data = patients_clean5,
+                family = "binomial")
+```
+
+```{r, eval=FALSE}
+summary(log_poms)
+exp(cbind(OR = coef(log_poms), confint(log_poms)))
+```
+
+```{r}
+tab_model(log_poms, transform = NULL)
+```
+
+## Primary outcome: Mortality
+
+### 30-day and 60-day mortality
+
+```{r}
+log_postmort30 <- glm(postmort30 ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                        S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                        malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                        S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                        night + anesgrade + surgrade,
+                  data = patients_clean5,
+                  family = "binomial")
+
+
+log_postmort60 <- glm(postmort60 ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                        S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                        malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                        S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                        night + anesgrade + surgrade,
+                  data = patients_clean5,
+                  family = "binomial")
+```
+
+```{r, eval=FALSE}
+summary(log_postmort30)
+exp(cbind(OR = coef(log_postmort30 ), confint(log_postmort30 )))
+
+summary(log_postmort60)
+exp(cbind(OR = coef(log_postmort60), confint(log_postmort60)))
+```
+
+```{r}
+tab_model(log_postmort30, log_postmort60, log_poms, transform = NULL)
+```
+
+```{r, eval=FALSE}
+#predicted probability for mortality
+val.prob(p = predict(log_postmort30, type = "response", newdata = patients_clean5), y = (patients_clean5)$icu_adm)
+val.prob(p = predict(log_postmort60, type = "response", newdata = patients_clean5), y = (patients_clean5)$icu_adm)
+```
+
+
+## Secondary outcome: LOS
+
+### Postoperative length of stay
+
+```{r}
+library(MASS)
+library(magrittr)
+
+qplot(patients_clean5$S07PostopLOS, geom = "histogram", binwidth = 2)
+mean(patients_clean5$S07PostopLOS, na.rm=TRUE) %>% round(2); var(patients_clean5$S07PostopLOS, na.rm=TRUE) %>% round(2) #mean and variance
+var(patients_clean5$S07PostopLOS, na.rm=TRUE)/mean(patients_clean5$S07PostopLOS, na.rm=TRUE) %>% round(2) #variance ratio, use negative binomial regression
+
+log_los_compos1 <- glm.nb(S07PostopLOS ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                    S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                    malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                    S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                    night + anesgrade + surgrade,
+                  data = patients_clean5)
+```
+
+```{r, eval=FALSE}
+summary(log_los_compos1)
+exp(cbind(IRR = coef(log_los_compos1), confint(log_los_compos1)))
+```
+
+```{r}
+tab_model(log_los_compos1, transform = NULL)
+```
+
+## Exploratory outcomes: POMS components
+
+### POMS inherent to ICU
+```{r, eval=FALSE}
+log_poms_cardpulmren <- glm(poms_cardpulmren ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                          S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                          malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                          S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                          night + anesgrade + surgrade,
+                        data = patients_clean5,
+                        family = "binomial")
+summary(log_poms_cardpulmren)
+exp(cbind(OR = coef(log_poms_cardpulmren), confint(log_poms_cardpulmren)))
+```
+
+### Each single POMS component
+```{r, eval=FALSE}
+log_poms_cardio <- glm(POMS_Cardio ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                              S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                              malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                              S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                              night + anesgrade + surgrade,
+                            data = patients_clean5,
+                            family = "binomial")
+summary(log_poms_cardio)
+exp(cbind(OR = coef(log_poms_cardio), confint(log_poms_cardio)))
+
+log_poms_resp <- glm(POMS_Resp ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                         S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                         malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                         S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                         night + anesgrade + surgrade,
+                       data = patients_clean5,
+                       family = "binomial")
+summary(log_poms_resp)
+exp(cbind(OR = coef(log_poms_resp), confint(log_poms_resp)))
+
+log_poms_ren <- glm(POMS_Renal ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                       S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                       malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                       S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                       night + anesgrade + surgrade,
+                     data = patients_clean5,
+                     family = "binomial")
+summary(log_poms_ren)
+exp(cbind(OR = coef(log_poms_ren), confint(log_poms_ren)))
+
+log_poms_gastro <- glm(POMS_Gastro ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                      S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                      malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                      S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                      night + anesgrade + surgrade,
+                    data = patients_clean5,
+                    family = "binomial")
+summary(log_poms_gastro)
+exp(cbind(OR = coef(log_poms_gastro), confint(log_poms_gastro)))
+
+log_poms_inf <- glm(POMS_Inf ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                         S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                         malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                         S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                         night + anesgrade + surgrade,
+                       data = patients_clean5,
+                       family = "binomial")
+summary(log_poms_inf)
+exp(cbind(OR = coef(log_poms_inf), confint(log_poms_inf)))
+
+log_poms_neuro <- glm(POMS_Neuro ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                      S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                      malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                      S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                      night + anesgrade + surgrade,
+                    data = patients_clean5,
+                    family = "binomial")
+summary(log_poms_neuro)
+exp(cbind(OR = coef(log_poms_neuro), confint(log_poms_neuro)))
+
+log_poms_haem <- glm(POMS_Haem ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                        S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                        malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                        S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                        night + anesgrade + surgrade,
+                      data = patients_clean5,
+                      family = "binomial")
+summary(log_poms_haem)
+exp(cbind(OR = coef(log_poms_haem), confint(log_poms_haem)))
+
+log_poms_wound <- glm(POMS_Wound ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                       S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                       malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                       S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                       night + anesgrade + surgrade,
+                     data = patients_clean5,
+                     family = "binomial")
+summary(log_poms_wound)
+exp(cbind(OR = coef(log_poms_wound), confint(log_poms_wound)))
+
+log_poms_pain <- glm(POMS_Pain ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                        S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                        malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                        S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                        night + anesgrade + surgrade,
+                      data = patients_clean5,
+                      family = "binomial")
+summary(log_poms_pain)
+exp(cbind(OR = coef(log_poms_pain), confint(log_poms_pain)))
+```
+
+
+## Regression diagnostics: Primary outcome
+
+### Predicted probability
+
+```{r}
+val.prob(p = predict(log_poms, type = "response", newdata = patients_clean5), y = (patients_clean5)$icu_adm)
+```
+
+### Goodness of fit (Hosmer Lemeshow test)
+
+```{r}
+library(ResourceSelection)
+hos_poms <- hoslem.test(patients_clean5$POMS, fitted(log_poms), g=10)
+hos_poms #p<0.05 which means: no good model fit
+```
+
+### Influential values
+
+```{r}
+library(broom)
+theme_set(theme_classic())
+
+plot(log_poms, which = 4, id.n = 3) #3 most extreme values in data
+
+model.data <- augment(log_poms) %>% mutate(index = 1:n()) #compute standardized residuals and Cook's distance
+model.data %>% top_n(3, .cooksd) #top 3 Cook's distances
+model.data2 <- model.data %>% filter(abs(.std.resid) > 3) #Select outliers that are stand. residuals >3
+
+ggplot(model.data, aes(index, .std.resid)) +  geom_point(aes(color = poms), alpha = .5) + theme_bw() #Plot standardized residuals
+```
+
+### Multi-collinearity check between confounders
+
+```{r}
+library(car)
+car::vif(log_poms) #No value is >5
+```
+
+```{r, eval=FALSE}
+#Linearity assumption (only for continuous confounders)
+probabilities <- predict(log_poms, type = "response")
+predicted.classes <- ifelse(probabilities > 0.5, "pos", "neg")
+
+predictors <- c(CONITNUES VARIABLES)
+patients_clean5_poms_prob <- patients_clean5 %>%
+  mutate(logit = log(probabilities/(1-probabilities))) %>%
+  gather(key = "predictors", value = "predictor.value", -logit)
+
+ggplot(patients_clean5_poms_prob, aes(logit, predictor.value))+
+  geom_point(size = 0.5, alpha = 0.5) +
+  geom_smooth(method = "loess") + 
+  theme_bw() + 
+  facet_wrap(~predictors, scales = "free_y")
+```
+
+
+# Survival anaylsis {.tabset}
+
+## LOS
+
+```{r, eval=FALSE}
+library(survival)
+library(survminer)
+
+##define censor variable
+sum(is.na(patients_clean5$S07PostopLOS)
+patients_clean5$los_mis <- is.na(patients_clean5$S07PostopLOS)
+patients_clean5 <- patients_clean5 %>%  mutate(status = ifelse(los_mis == "FALSE", 1, 0)) #patients with missing LOS are censored
+
+##define LOS until day 60
+patients_clean5$los60 <- patients_clean5$S07PostopLOS
+patients_clean5$los60[patients_clean5$los60 >60] <- NA
+
+km_los <- survfit(Surv(los60, status) ~ icu_adm, data=patients_clean5)
+summary(km_mort30, times = c(1,2, 3,4,5,6,7,10,20,30,40,50,60,90*(1:10)))
+
+ggsurvplot(km_los, pval = TRUE, xlab = "Time in days",risk.table.col = "strata", linetype = "strata",ggtheme = theme_bw(),
+           palette = c("#E7B800", "#2E9FDF"), legend.labs =c("Ward", "ICU"), break.time.by = 10,
+           data = patients_clean5)
+
+```
+
+## Mortality
+
+```{r, eval=FALSE}
+##Define censor variable
+patients_clean5 <- patients_clean5 %>%  mutate(status_mort30 = ifelse(S07StatusAtDischarge == "D", 1, 0)) #patients who are alive at discharge are censored
+
+##Limit LOS to 60 days
+patients_clean5$los60 <- patients_clean5$S07PostopLOS
+patients_clean5$los60[patients_clean5$los60 >60] <- NA
+sum(is.na(patients_clean5$los60))
+
+km_mort <- survfit(Surv(los60, status_mort) ~ icu_adm, data=patients_clean5)
+summary(km_mort, times = c(1,2, 3,4,5,6,7,10,20,30,40,50,60,90*(1:10)))
+
+
+ggsurvplot(km_mort, pval = TRUE, xlab = "Time in days",risk.table.col = "strata", linetype = "strata",ggtheme = theme_bw(),
+           palette = c("#E7B800", "#2E9FDF"), legend.labs =c("Ward", "ICU"), break.time.by = 10,
+           data = patients_clean5)
+
+```
+
+
+# Instrumental variable regression (Two-Stage Least Square) {.tabset}
+
+```{r}
+library(AER)
+library(systemfit)
+```
+
+## Recategorise instruments
+
+### CCU Capacity = empty beds + discharge-ready patients
+```{r}
+qplot(patients_clean5$CCUCapacityTimeofSurgery, geom = "histogram", binwidth = 1)
+
+patients_clean5$icucap[patients_clean5$CCUCapacityTimeofSurgery <=5] <- 1
+patients_clean5$icucap[patients_clean5$CCUCapacityTimeofSurgery >5 & patients_clean5$CCUCapacityTimeofSurgery <=10] <- 2
+patients_clean5$icucap[patients_clean5$CCUCapacityTimeofSurgery >10 & patients_clean5$CCUCapacityTimeofSurgery <=15] <- 3
+patients_clean5$icucap[patients_clean5$CCUCapacityTimeofSurgery >15] <- 4
+patients_clean5$icucap <- as.ordered(patients_clean5$icucap)
+xtabs (~ poms_compos1 + icucap, data = patients_clean5)
+
+```
+
+### Empty beds
+```{r}
+qplot(patients_clean5$EmptyBedsTimeofSurgery, geom = "histogram", binwidth = 1)
+
+patients_clean5$emptybed_cat[patients_clean5$EmptyBedsTimeofSurgery <=5] <- 1
+patients_clean5$emptybed_cat[patients_clean5$EmptyBedsTimeofSurgery >5 & patients_clean5$EmptyBedsTimeofSurgery <=10] <- 2
+patients_clean5$emptybed_cat[patients_clean5$EmptyBedsTimeofSurgery >10 & patients_clean5$EmptyBedsTimeofSurgery <=15] <- 3
+patients_clean5$emptybed_cat[patients_clean5$EmptyBedsTimeofSurgery >15] <- 4
+patients_clean5$emptybed_cat <- as.ordered(patients_clean5$emptybed_cat)
+xtabs (~ poms_compos1 + emptybed_cat, data = patients_clean5)
+
+#Based on spotlight paper
+
+patients_clean5$emptybed_cat2[patients_clean5$EmptyBedsTimeofSurgery == 0] <- 0
+patients_clean5$emptybed_cat2[patients_clean5$EmptyBedsTimeofSurgery == 1] <- 1
+patients_clean5$emptybed_cat2[patients_clean5$EmptyBedsTimeofSurgery >=2] <- 2
+patients_clean5$emptybed_cat2 <- as.ordered(patients_clean5$emptybed_cat2)
+xtabs (~ poms_compos1 + emptybed_cat2, data = patients_clean5)
+
+```
+
+### Discharge-ready patients
+```{r}
+patients_clean5 <- patients_clean5 %>%
+  mutate(disready1 = 
+           ifelse(S02TimeOfSurgeryStartIncision %in% c("8", "12", "16"), 
+                  (DischargeReady0800),
+                  ifelse(S02TimeOfSurgeryStartIncision %in% c("20"), 
+                         (DischargeReady2000),
+                         ifelse(S02TimeOfSurgeryStartIncision %in% c("0", "4"),
+                                (DischargeReady2000), NA))))
+qplot(patients_clean5$disready1, geom = "histogram", binwidth = 1)
+
+patients_clean5$disready2[patients_clean5$disready1 <=5] <- 1
+patients_clean5$disready2[patients_clean5$disready1 >5 & patients_clean5$disready1 <=10] <- 2
+patients_clean5$disready2[patients_clean5$disready1 >10 & patients_clean5$disready1 <=15] <- 3
+patients_clean5$disready2[patients_clean5$disready1 >15] <- 4
+patients_clean5$disready2 <- as.ordered(patients_clean5$disready2)
+xtabs (~ poms_compos1 + disready2, data = patients_clean5)
+```
+
+## Stage 1 - Logistic regression: ICU admission
+
+### Predictors (inlcuding instruments) on ICU admission
+
+Logistic regression on outcome "ICU admission"
+```{r}
+log_icu <- glm(icu_adm ~ S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                        S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport +
+                        S02PreopLOS +malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + 
+                        rend + diabet + polytr + gcs_low + S03SystolicBloodPressureBpAtPreAssessment + 
+                        S03PulseRateAtPreoperativeAssessment + dyspn + night + anesgrade + surgrade +
+                 
+                        disready2 + emptybed_cat,
+                      
+                        data = patients_clean5,
+                        family = "binomial")
+```
+
+```{r}
+tab_model(log_icu, transform = NULL)
+```
+
+```{r}
+plot_model(log_icu, transform = NULL)
+```
+
+
+## Stage 2 - IV regression: Modified POMS
+
+### POMS
+
+```{r}
+iv_poms <- ivreg(POMS ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                   S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                   malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                   S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                   night + anesgrade + surgrade |
+                   
+                     S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                     S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                     malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                     S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                     night + anesgrade + surgrade +
+                   
+                     disready2 + emptybed_cat,
+                 data = patients_clean5)
+```
+
+```{r}
+summary(iv_poms)
+cbind(Estimate = coef(iv_poms), confint(iv_poms))
+```
+
+```{r, eval=FALSE}
+tab_model(iv_poms, transform = NULL)
+```
+
+
+### IV diagostics: POMS
+```{r}
+summary(iv_poms, vcov = sandwich, diagnostics = TRUE)
+```
+
+
+## Stage 2 - IV regression: Mortality
+
+### Mortality
+
+```{r}
+iv_mort30 <- ivreg(postmort30 ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                           S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                           malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                           S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                           night + anesgrade + surgrade |
+                           
+                           S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                           S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                           malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                           S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                           night + anesgrade + surgrade +
+                           
+                            disready2 + emptybed_cat,
+                         data = patients_clean5)
+
+
+iv_mort60 <- ivreg(postmort60 ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                           S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                           malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                           S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                           night + anesgrade + surgrade |
+                           
+                           S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                           S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                           malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                           S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                           night + anesgrade + surgrade +
+                           
+                            disready2 + emptybed_cat,
+                         data = patients_clean5)
+
+```
+
+```{r}
+summary(iv_mort30)
+cbind(Estimate = coef(iv_mort30), confint(iv_mort30))
+```
+
+```{r}
+tab_model(iv_mort30, transform = NULL)
+```
+
+
+```{r}
+summary(iv_mort60)
+cbind(Estimate = coef(iv_mort60), confint(iv_mort60))
+```
+
+```{r}
+tab_model(iv_mort60, transform = NULL)
+```
+
+
+### IV diagnostics: Mortality
+```{r}
+summary(iv_mort30, vcov = sandwich, diagnostics = TRUE)
+```
+
+
+
+# Compare multivariable regression vs. IV regression {.tabset}
+
+## POMS modified
+
+### Multivariable logistic regression
+
+```{r}
+plot_model(log_poms, transform = NULL)
+
+```
+
+### IV regression
+
+```{r, eval=FALSE}
+plot_model(iv_poms_compos1, transform = NULL)
+```
+
+## Mortality
+
+### Multivariable logistic regression
+
+```{r}
+plot_model(log_postmort30, transform = NULL)
+```
+
+### IV regression
+
+```{r, eval=FALSE}
+plot_model(iv_mort30, transform = NULL)
+```
+
+# Plotting: All primary outcomes {.tabset}
+
+```{r, eval=FALSE}
+log_mort30_plot <- 
+  structure(list(param = c("Unadjusted regression (without confounders)",
+                           "Multivariable regression (observed confounders)", 
+                           "Instrumental variable method (observed and unobserved confounders)") , 
+  low2.5 = c(2.66, 1.49, 0.81), 
+  est = c(2.99, 1.91, 0.91), up2.5 = c(3.31, 2.32, 1.05)), 
+  .Names = c("param", "low2.5", "est", "up2.5"), row.names = 7:9, 
+  class = c("data.frame", "mplus.params"))
+
+log_mort60_plot <- 
+  structure(list(param = c("Unadjusted regression (without confounders)",
+                           "Multivariable regression (observed confounders)", 
+                           "Instrumental variable method (observed and unobserved confounders)") , 
+  low2.5 = c(2.58, 1.38, 0.8), 
+  est = c(2.89, 1.77, 0.9), up2.5 = c(3.19, 2.17, 1.0)), 
+  .Names = c("param", "low2.5", "est", "up2.5"), row.names = 7:9, 
+  class = c("data.frame", "mplus.params"))
+
+log_poms_plot <- 
+  structure(list(param = c("Unadjusted regression (without confounders)",
+                           "Multivariable regression (observed confounders)", 
+                           "Instrumental variable method (observed and unobserved confounders)") , 
+  low2.5 = c(2.63, 1.96, 1.43), 
+  est = c(2.74, 2.09, 1.77), up2.5 = c(2.84, 2.23, 2.19)), 
+  .Names = c("param", "low2.5", "est", "up2.5"), row.names = 7:9, 
+  class = c("data.frame", "mplus.params"))
+
+
+limits <- aes(ymax  = up2.5, ymin = low2.5) 
+
+plot1 <- ggplot(log_mort30_plot, aes(x=param, y=est)) + 
+  geom_pointrange(limits, color = "darkblue") + 
+  scale_x_discrete("") + 
+  geom_hline(yintercept=0, color="red") + 
+  theme_bw() + 
+  theme(text = element_text(size=14)) +
+  ylab(NULL) + 
+  coord_flip() +
+  ylim(0.8, 3.4) +
+  ggtitle("30-day mortality")
+
+plot2 <- ggplot(log_mort60_plot, aes(x=param, y=est)) + 
+  geom_pointrange(limits, color="darkblue") + 
+  scale_x_discrete("") + 
+  geom_hline(yintercept=0, color="red") + 
+  theme_bw() + 
+  theme(text = element_text(size=14)) +
+  ylab(NULL) + 
+  coord_flip() +
+  ylim(0.8, 3.4) +
+  ggtitle("60-day mortality") +
+  ylab("Risk ratio (95% Confidence Interval) \n between critical care and ward admitted cohort after surgery")
+
+plot3 <- ggplot(log_poms_plot, aes(x=param, y=est)) + 
+  geom_pointrange(limits, color="darkblue") + 
+  scale_x_discrete("") + 
+  geom_hline(yintercept=0, color="red") + 
+  theme_bw() + 
+  theme(text = element_text(size=14)) +
+  ylab(NULL) + 
+  coord_flip() +
+  ylim(0.8, 3.4) +
+  ggtitle("7-day morbidity")
+
+library(gridExtra)
+grid.arrange(plot3, plot1, plot2, ncol=1)
+```
+
+```{r}
+poms_graphs <- data.frame("OR" = c(NA, 2.74, 2.09, 1.77),
+                          "lower" = c(NA, 2.63, 1.96, 1.43),
+                          "upper" = c(NA, 2.84, 2.23, 2.19),
+                          "analysis" = c(4, 3, 2, 1)
+)
+
+mort30_graphs <- data.frame("OR" = c(NA, 2.99, 1.91, 0.91),
+                          "lower" = c(NA, 2.66, 1.49, 0.81),
+                          "upper" = c(NA, 3.31, 2.32, 1.05),
+                          "analysis" = c(4, 3, 2, 1)
+)
+
+mort60_graphs <- data.frame("OR" = c(NA, 2.89, 1.77, 0.9),
+                          "lower" = c(NA, 2.58, 1.38, 0.8),
+                          "upper" = c(NA, 3.19, 2.17, 1.0),
+                          "analysis" = c(4, 3, 2, 1)
+)
+
+
+a <- ggplot(poms_graphs, aes(y = analysis, x = OR)) +
+   geom_vline(aes(xintercept = 1), size = 0.5, linetype = "dashed") +
+  geom_errorbarh(aes(xmax = lower, xmin = upper), size = 1, height =  .2, color = "gray50") +
+   geom_point(size = 3.5) +
+  xlim(0.8, 3.5) +
+  ylim(0, 4) +
+  theme_bw()+
+    theme(panel.grid.minor = element_blank()) +
+    xlab("Risk ratio (95% Confidence Interval) between critical care versus ward admission after surgery") +
+  ggtitle("7-day morbidity") +
+  theme(
+      axis.text.y = element_text(size = 12),
+    axis.title.y=element_blank(),
+        axis.ticks.x=element_blank(),
+    axis.text.x=element_blank(),
+    axis.title.x = element_blank(),
+    plot.title = element_text(size=18, hjust = 0.5, face="bold"),
+    axis.ticks.y=element_blank(),
+  ) +
+    scale_y_discrete(limit = c("1", "2", "3"),
+                     labels = c("Instrumental variable method \n (with observed and unobserved confounders)", "Adjusted multivariable regression \n (with observed confounders)", "Unadjusted regression \n (without confounders)"))
+
+
+b <- ggplot(mort30_graphs, aes(y = analysis, x = OR)) +
+   geom_vline(aes(xintercept = 1), size = 0.5, linetype = "dashed") +
+  geom_errorbarh(aes(xmax = lower, xmin = upper), size = 1, height =  .2, color = "gray50") +
+   geom_point(size = 3.5) +
+  xlim(0.8, 3.5) +
+  ylim(0, 4) +
+  theme_bw()+
+    theme(panel.grid.minor = element_blank()) +
+    ggtitle("30-day mortality") +
+  theme(
+      axis.text.y = element_text(size = 12),
+    axis.ticks.y=element_blank(),
+    axis.ticks.x=element_blank(),
+    axis.text.x=element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y=element_blank(),
+    plot.title = element_text(size=18, hjust = 0.5, face="bold")
+  ) +
+    scale_y_discrete(limit = c("1", "2", "3"),
+                     labels = c("Instrumental variable method \n (with observed and unobserved confounders)", "Adjusted multivariable regression \n (with observed confounders)", "Unadjusted regression \n (without confounders)"))
+
+
+
+c <- ggplot(mort60_graphs, aes(y = analysis, x = OR)) +
+   geom_vline(aes(xintercept = 1), size = 0.5, linetype = "dashed") +
+  geom_errorbarh(aes(xmax = lower, xmin = upper), size = 1, height =  .2, color = "gray50") +
+   geom_point(size = 3.5) +
+  xlim(0.8, 3.5) +
+  ylim(0, 4) +
+  theme_bw()+
+    theme(panel.grid.minor = element_blank()) +
+    xlab("Risk ratio (95% Confidence Interval) between critical care versus ward admission after surgery") +
+  ggtitle("60-day mortality") +
+  theme(
+    axis.text.x = element_text(size = 14),
+      axis.text.y = element_text(size = 12),
+    axis.ticks.y=element_blank(),
+    axis.title.x = element_text(size = 14),
+    axis.title.y=element_blank(),
+    plot.title = element_text(size=18, hjust = 0.5, face="bold")
+  ) +
+    scale_y_discrete(limit = c("1", "2", "3"),
+                     labels = c("Instrumental variable method \n (with observed and unobserved confounders)", "Adjusted multivariable regression \n (with observed confounders)", "Unadjusted regression \n (without confounders)"))
+
+library(gridExtra)
+grid.arrange(a, b, c, ncol=1)
+
+grapha <- ggplotGrob(a)
+graphb <- ggplotGrob(b)
+graphc <- ggplotGrob(c)
+
+grid::grid.newpage()
+grid::grid.draw(rbind(grapha, graphb, graphc))
+```
+
+
+# Sensitivty analyses: SORT {.tabset}
+
+## Creating SORT data
+
+```{r, eval=FALSE}
+#Drop missing SORT
+sort_mis <- which(!complete.cases(patients_clean5$SORT_mort))
+sum(is.na(patients_clean5$sort_mis))
+
+#Create normal SORT variable
+library(arm)
+patients_clean5$sort_mort_normal <- invlogit(patients_clean5$SORT_mort) * 100
+```
+
+
+## Subgroups based on every percent
+
+```{r, eval=FALSE}
+##1% groups
+patients_clean5_sort05 <- patients_clean5 %>% filter(sort_mort_normal >= 0 & sort_mort_normal < 0.5)
+patients_clean5_sort1 <- patients_clean5 %>% filter(sort_mort_normal >= 0 & sort_mort_normal < 1)
+patients_clean5_sort2 <- patients_clean5 %>% filter(sort_mort_normal >= 1 & sort_mort_normal < 2)
+
+patients_clean5_sort3 <- patients_clean5 %>% filter(sort_mort_normal >= 2 & sort_mort_normal < 3)
+patients_clean5_sort3$gcs_low <- as.numeric(patients_clean5_sort3$gcs_low)
+patients_clean5_sort3$polytr <- as.numeric(patients_clean5_sort3$polytr)
+
+patients_clean5_sort4 <- patients_clean5 %>% filter(sort_mort_normal >= 3 & sort_mort_normal < 4)
+patients_clean5_sort4$gcs_low <- as.numeric(patients_clean5_sort4$gcs_low)
+patients_clean5_sort4$polytr <- as.numeric(patients_clean5_sort4$polytr)
+
+patients_clean5_sort5 <- patients_clean5 %>% filter(sort_mort_normal >= 4 & sort_mort_normal <5)
+##Convert factor variables with one category to numeric 
+patients_clean5_sort5$gcs_low <- as.numeric(patients_clean5_sort5$gcs_low)
+patients_clean5_sort5$polytr <- as.numeric(patients_clean5_sort5$polytr)
+
+patients_clean5_sort6 <- patients_clean5 %>% filter(sort_mort_normal >= 5 & sort_mort_normal < 6)
+patients_clean5_sort6$gcs_low <- as.numeric(patients_clean5_sort6$gcs_low)
+patients_clean5_sort6$polytr <- as.numeric(patients_clean5_sort6$polytr)
+
+patients_clean5_sort7 <- patients_clean5 %>% filter(sort_mort_normal >= 6 & sort_mort_normal < 7)
+
+patients_clean5_sort8 <- patients_clean5 %>% filter(sort_mort_normal >= 7 & sort_mort_normal < 8)
+patients_clean5_sort8$gcs_low <- as.numeric(patients_clean5_sort8$gcs_low)
+patients_clean5_sort8$polytr <- as.numeric(patients_clean5_sort8$polytr)
+
+patients_clean5_sort9 <- patients_clean5 %>% filter(sort_mort_normal >= 8 & sort_mort_normal < 9)
+patients_clean5_sort9$gcs_low <- as.numeric(patients_clean5_sort9$gcs_low)
+patients_clean5_sort9$polytr <- as.numeric(patients_clean5_sort9$polytr)
+patients_clean5_sort9$asa <- as.numeric(patients_clean5_sort9$asa)
+
+patients_clean5_sort10 <- patients_clean5 %>% filter(sort_mort_normal >=9 & sort_mort_normal < 10)
+patients_clean5_sort10$gcs_low <- as.numeric(patients_clean5_sort10$gcs_low)
+patients_clean5_sort10$polytr <- as.numeric(patients_clean5_sort10$polytr)
+patients_clean5_sort10$asa <- as.numeric(patients_clean5_sort10$asa)
+
+patients_clean5_sort11 <- patients_clean5 %>% filter(sort_mort_normal >=10)
+
+
+# Forest plot 30-day mortality
+mean3 <-  c(NA, -2, 1, -5, 28, 35, -11, 63, -2, -46, NA, -32)
+lower3 <- c(NA, -7, -21, -20, -27, -71, -52, -33, -35, -116, NA, -76)
+upper3 <- c(NA, 4, 24, 10, 82, 142, 29, 159, 30, 25, NA, 11)
+
+tabletext3 <- cbind(c("SORT", "0-1%", "1-2%", "2-3%",  "3-4%", "4-5%", "5-6%", "6-7%", "7-8%", "8-9%","9-10%", ">10%"))
+
+forestplot(tabletext3, mean3, lower3, upper3,
+           is.summary = FALSE,
+           clip=c(-100,100),
+           xlab = "Relative risk difference in percent (95% Confidence interval) between critical care versus ward admission after surgery",
+           title = "30-day mortality",
+           xticks = c(0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, -10, -20, -30, -40, -50,
+                       -60,  -70, - 80, -90,- 100),
+           col=fpColors(box="royalblue",line="darkblue", summary="royalblue"))
+
+```
+
+## Subgroups based on tertiles
+
+```{r, eval=FALSE}
+##tertiles
+patients_clean5$sort_mort_normal_p25 <- as.ordered(cut2(patients_clean5$sort_mort_normal, g=4))
+xtabs(~ poms_compos1 + sort_mort_normal_p25, data = patients_clean5)
+
+patients_clean5_sort_q1 <- patients_clean5 %>% filter(sort_mort_normal < 0.180)
+patients_clean5_sort_q1$gcs_low <- as.numeric(patients_clean5_sort_q1$gcs_low)
+patients_clean5_sort_q1$polytr <- as.numeric(patients_clean5_sort_q1$polytr)
+patients_clean5_sort_q1$asa <- as.numeric(patients_clean5_sort_q1$asa)
+
+patients_clean5_sort_q4 <- patients_clean5 %>% filter(sort_mort_normal >=0.9176)
+
+##No results so far due to factor variable error - need to identify variable
+```
+
+## Subgroups based on thresholds
+
+```{r, eval=FALSE}
+
+patients_clean5_sort_under05 <- patients_clean5 %>% filter(sort_mort_normal <0.5)
+patients_clean5_sort_over05 <- patients_clean5 %>% filter(sort_mort_normal >= 0.5)
+
+patients_clean5_sort_under1 <- patients_clean5 %>% filter(sort_mort_normal <1)
+patients_clean5_sort_over1 <- patients_clean5 %>% filter(sort_mort_normal >= 1)
+
+patients_clean5_sort_under2 <- patients_clean5 %>% filter(sort_mort_normal <2)
+patients_clean5_sort_over2 <- patients_clean5 %>% filter(sort_mort_normal >= 5)
+
+patients_clean5_sort_under3 <- patients_clean5 %>% filter(sort_mort_normal < 3)
+patients_clean5_sort_over3 <- patients_clean5 %>% filter(sort_mort_normal >= 3)
+
+patients_clean5_sort_under4 <- patients_clean5 %>% filter(sort_mort_normal < 4)
+patients_clean5_sort_over4 <- patients_clean5 %>% filter(sort_mort_normal >= 4)
+
+patients_clean5_sort_under5 <- patients_clean5 %>% filter(sort_mort_normal < 5)
+patients_clean5_sort_over5 <- patients_clean5 %>% filter(sort_mort_normal >= 5)
+
+patients_clean5_sort_under6 <- patients_clean5 %>% filter(sort_mort_normal < 6)
+patients_clean5_sort_over6 <- patients_clean5 %>% filter(sort_mort_normal >= 6)
+
+patients_clean5_sort_under7 <- patients_clean5 %>% filter(sort_mort_normal < 7)
+patients_clean5_sort_over7 <- patients_clean5 %>% filter(sort_mort_normal >= 7)
+
+
+patients_clean5_sort_under8 <- patients_clean5 %>% filter(sort_mort_normal < 8)
+patients_clean5_sort_over8 <- patients_clean5 %>% filter(sort_mort_normal >= 8)
+
+patients_clean5_sort_under9 <- patients_clean5 %>% filter(sort_mort_normal < 9)
+patients_clean5_sort_over9 <- patients_clean5 %>% filter(sort_mort_normal >= 9)
+
+
+patients_clean5_sort_under10 <- patients_clean5 %>% filter(sort_mort_normal < 10)
+patients_clean5_sort_over10 <- patients_clean5 %>% filter(sort_mort_normal >= 10)
+
+
+library(forestplot)
+
+
+# Forest plot 30-day mortality
+mean <-  c(NA, 0.86, 0.77, 0.84, 0.81, 0.77, 0.81, 0.81, 0.76, 0.65, 0.68)
+lower <- c(NA, 0.61, 0.38, 0.47, 0.46, 0.38, 0.46, 0.49, 0.39, 0.27, 0.24)
+upper <- c(NA, 1.11, 1.16, 1.21, 1.19, 1.16, 1.15, 1.13, 1.14, 1.04, 1.11)
+
+tabletext <- cbind(c("SORT", ">1%", ">2%", ">3%",  ">4%", ">5%", ">6%", ">7%", ">8%", ">9%",">10%"))
+
+forestplot(tabletext, mean, lower, upper,
+           is.summary = FALSE,
+           clip=c(-100,100),
+           xlab = "Risk ratio (95% Confidence interval) between critical care versus ward admission aftr surgery",
+           title = "30-day mortality",
+           xticks = c(0, 0.25, 0.5, 0.75, 1, 1.25),
+           zero = 1,
+           col=fpColors(box="royalblue",line="darkblue", summary="royalblue"))
+
+
+# Forest plot 60-day mortality
+mean2 <-  c(NA, 0.85, 0.72, 0.8, 0.77, 0.72, 0.76, 0.79, 0.74, 0.64, 0.7)
+lower2 <- c(NA, 0.59, 0.29, 0.4, 0.37, 0.29, 0.39, 0.45, 0.34, 0.24, 0.26)
+upper2 <- c(NA, 1.12, 1.14, 1.19, 1.17, 1.14, 1.13, 1.13, 1.14, 1.05, 1.14)
+
+tabletext2 <- cbind(c("SORT", ">1%", ">2%", ">3%",  ">4%", ">5%", ">6%", ">7%", ">8%", ">9%",">10%"))
+
+forestplot(tabletext2, mean2, lower2, upper2,
+           is.summary = FALSE,
+           clip=c(-100,100),
+           xlab = "Risk ratio (95% Confidence interval) between critical care versus ward admission after surgery",
+           title = "60-day mortality",
+           xticks = c(0, 0.25, 0.5, 0.75, 1, 1.25),
+           zero = 1,
+           col=fpColors(box="royalblue",line="darkblue", summary="royalblue"))
+
+# Forest plot 30-day mortality
+mean5 <-  c(NA, -2, -2, -3, -2, -1, -1, -4, -4, -5, -4)
+lower5 <- c(NA, -7, -9, -9, -9, -9, -9, -13, -14, -15, -14)
+upper5 <- c(NA, 4, 5, 4, 5, 6, 7, 6, 5, 5, 6)
+
+tabletext5 <- cbind(c("SORT", "<1%", "<2%", "<3%",  "<4%", "<5%", "<6%", "<7%", "<8%", "<9%","<10%"))
+
+forestplot(tabletext5, mean5, lower5, upper5,
+           is.summary = FALSE,
+           clip=c(-100,100),
+           xlab = "Relative risk difference in percent (95% Confidence interval) between critical care versus ward admission after surgery",
+           title = "30-day mortality",
+           xticks = c(0, 5, 10, -5, -10, -15, -20),
+           col=fpColors(box="red",line="red", summary="red"))
+
+
+# Forest plot 60-day mortality
+mean6 <-  c(NA, -2, -1, -1, 0, 1, 0, -3, -3, -5, -5)
+lower6 <- c(NA, -7, -8, -8, -7, -8, -8, -12, -13, -16, -15)
+upper6 <- c(NA, 4, 6, 6, 8, 9, 9,7,  6, 5, 6)
+
+tabletext6 <- cbind(c("SORT", "<1%", "<2%", "<3%",  "<4%", "<5%", "<6%", "<7%", "<8%", "<9%","<10%"))
+
+forestplot(tabletext6, mean6, lower6, upper6,
+           is.summary = FALSE,
+           clip=c(-100,100),
+           xlab = "Relative risk difference in percent (95% Confidence interval) between critical care versus ward admission after surgery",
+           title = "60-day mortality",
+           xticks = c(0, 5, 10, -5, -10, -15, -20),
+           col=fpColors(box="red",line="red", summary="red"))
+
+#tab_model(iv_mort30_sort_over9, transform = NULL)
+```
+
+```{r}
+# Plot with ggplot
+
+sort_30mort <- data.frame("OR" = c(0.86, 0.77, 0.84, 0.81, 0.77, 0.81, 0.81, 0.76, 0.65, 0.68, NA),
+                          "lower" = c(0.61, 0.38, 0.47, 0.46, 0.38, 0.46, 0.49, 0.39, 0.27, 0.24, NA),
+                          "upper" = c(1.11, 1.16, 1.21, 1.19, 1.16, 1.15, 1.13, 1.14, 1.04, 1.11, NA),
+                          "label" = c(">1%", ">2%", ">3%", ">4%", ">5%", ">6%", ">7%", ">8%", ">9%",">10%", NA),
+                          "sort" = c(1,2,3,4,5,6,7,8,9,10, 11)
+)
+
+p <- ggplot(sort_30mort, aes(y = sort, x = OR)) +
+   geom_vline(aes(xintercept = 1), size = 0.5, linetype = "dashed") +
+  geom_smooth(method = lm, se = FALSE, size = 1.5, color = "red", linetype = "dashed") +
+  geom_errorbarh(aes(xmax = lower, xmin = upper), size = 1, height =  .2, color = "gray50") +
+   geom_point(size = 3.5) +
+  xlim(0,2) +
+  ylim(0, 11) +
+  theme_bw()+
+    theme(panel.grid.minor = element_blank()) +
+  ylab("SORT risk groups") +
+   ggtitle("30-day mortality") +
+  theme(
+      axis.text.y = element_text(size = 16),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.y = element_text(size = 16),
+    plot.title = element_text(size=18, hjust = 0.5, face="bold"),
+  ) +
+  scale_y_discrete(limit = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10"),
+                     labels = c(">1%", ">2%", ">3%", ">4%", ">5%",  ">6%", ">7%", ">8%",  ">9%", ">10%"))
+
+
+
+
+sort_60mort <- data.frame("OR" = c(0.85, 0.72, 0.8, 0.77, 0.72, 0.76, 0.79, 0.74, 0.64, 0.7, NA),
+                          "lower" = c(0.59, 0.29, 0.4, 0.37, 0.29, 0.39, 0.45, 0.34, 0.24, 0.26, NA),
+                          "upper" = c(1.12, 1.14, 1.19, 1.17, 1.14, 1.13, 1.13, 1.14, 1.05, 1.14, NA),
+                          "label" = c(">1%", ">2%", ">3%", ">4%", ">5%", ">6%", ">7%", ">8%", ">9%",">10%", NA),
+                          "sort" = c(1,2,3,4,5,6,7,8,9,10, 11)
+)
+
+p2 <- ggplot(sort_60mort, aes(y = sort, x = OR)) +
+   geom_vline(aes(xintercept = 1), size = 0.5, linetype = "dashed") +
+  geom_smooth(method = lm, se = FALSE, size = 1.5, color = "red", linetype = "dashed") +
+  geom_errorbarh(aes(xmax = lower, xmin = upper), size = 1, height =  .2, color = "gray50") +
+   geom_point(size = 3.5) +
+  xlim(0, 2) +
+  ylim(0, 11) +
+  theme_bw()+
+    theme(panel.grid.minor = element_blank()) +
+  ylab("SORT risk groups") +
+    xlab("Risk ratio (95% Confidence Interval) between critical care versus ward admission after surgery") +
+  ggtitle("60-day mortality") +
+  theme(
+    axis.text.x = element_text(size = 16),
+      axis.text.y = element_text(size = 16),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    plot.title = element_text(size=18, hjust = 0.5, face="bold"),
+  ) +
+  scale_y_discrete(limit = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10"),
+                     labels = c(">1%", ">2%", ">3%", ">4%", ">5%",  ">6%", ">7%", ">8%",  ">9%", ">10%"))
+
+
+library(gridExtra)
+grid.arrange(p, p2, ncol=1)
+
+graph1 <- ggplotGrob(p)
+graph2 <- ggplotGrob(p2)
+
+grid::grid.newpage()
+grid::grid.draw(rbind(graph1, graph2))
+
+
+
+```
+
+
+
+# Sensitivity analyses: Procedures groups {.tabset}
+
+## Procedures groups
+
+```{r, eval=FALSE}
+patients_clean5_proc1 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 1)
+patients_clean5_proc1$gcs_low <- as.numeric(patients_clean5_proc1$gcs_low)
+patients_clean5_proc1$polytr <- as.numeric(patients_clean5_proc1$polytr)
+
+#patients_clean5_proc2 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 2)
+patients_clean5_proc2$gcs_low <- as.numeric(patients_clean5_proc2$gcs_low)
+patients_clean5_proc2$polytr <- as.numeric(patients_clean5_proc2$polytr)
+patients_clean5_proc2$asa <- as.numeric(patients_clean5_proc2$asa)
+
+
+patients_clean5_proc3 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 3)
+patients_clean5_proc3$gcs_low <- as.numeric(patients_clean5_proc3$gcs_low)
+patients_clean5_proc3$polytr <- as.numeric(patients_clean5_proc3$polytr)
+
+patients_clean5_proc4 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 4)
+patients_clean5_proc4$gcs_low <- as.numeric(patients_clean5_proc4$gcs_low)
+patients_clean5_proc4$polytr <- as.numeric(patients_clean5_proc4$polytr)
+
+
+patients_clean5_proc5 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 5)
+patients_clean5_proc6 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 6)
+patients_clean5_proc7 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 7)
+
+#patients_clean5_proc8 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 8)
+patients_clean5_proc8$gcs_low <- as.numeric(patients_clean5_proc8$gcs_low)
+patients_clean5_proc8$polytr <- as.numeric(patients_clean5_proc8$polytr)
+patients_clean5_proc8$asa <- as.numeric(patients_clean5_proc8$asa)
+
+patients_clean5_proc9 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 9)
+patients_clean5_proc10 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 10)
+
+#patients_clean5_proc11 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 11)
+patients_clean5_proc11$gcs_low <- as.numeric(patients_clean5_proc11$gcs_low)
+patients_clean5_proc11$polytr <- as.numeric(patients_clean5_proc11$polytr)
+patients_clean5_proc11$asa <- as.numeric(patients_clean5_proc11$asa)
+
+patients_clean5_proc12 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 12)
+patients_clean5_proc13 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 13)
+
+patients_clean5_proc15 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 15)
+patients_clean5_proc15$polytr <- as.numeric(patients_clean5_proc15$polytr)
+patients_clean5_proc15$S01Gender <- as.numeric(patients_clean5_proc15$S01Gender)
+patients_clean5_proc15$malig <- as.numeric(patients_clean5_proc15$malig)
+patients_clean5_proc15$demen <- as.numeric(patients_clean5_proc15$demen)
+patients_clean5_proc15$pulfib <- as.numeric(patients_clean5_proc15$pulfib)
+patients_clean5_proc15$rend <- as.numeric(patients_clean5_proc15$rend)
+
+patients_clean5_proc16 <- patients_clean5 %>% filter(S02PlannedProcedureMainGroup == 16)
+patients_clean5_proc16$gcs_low <- as.numeric(patients_clean5_proc16$gcs_low)
+patients_clean5_proc16$polytr <- as.numeric(patients_clean5_proc16$polytr)
+patients_clean5_proc16$S01Gender <- as.numeric(patients_clean5_proc16$S01Gender)
+patients_clean5_proc16$malig <- as.numeric(patients_clean5_proc16$malig)
+patients_clean5_proc16$demen <- as.numeric(patients_clean5_proc16$demen)
+patients_clean5_proc16$pulfib <- as.numeric(patients_clean5_proc16$pulfib)
+patients_clean5_proc16$rend <- as.numeric(patients_clean5_proc16$rend)
+
+# Forest plot procedures
+mean8 <-  c(NA, 1, NA, -32, 4, NA, 6, -11, NA, -7, 2, NA, 3, -15, NA, 0)
+lower8 <- c(NA, -12, NA, -106, -13, NA, -6, -43, NA, -23, -20, NA, -19, -51, NA, -19)
+upper8 <- c(NA, 15, NA, 41, 21, NA, 19, 21, NA, 9, 23, NA, 24, 20, NA, 19)
+
+tabletext8 <- cbind(c("Specialty", "Spinal", "Opthalmology", "Ear, nose, throat",  "Maxillo-facial", "Breast", "Cardio-thoracic", "Vascular", "Endoscopic", "Abdominal","Urology", "Gynecology", "Plastic surgery", "Orthopedic", "Obstetrics", "Interventional radiology"))
+
+forestplot(tabletext8, mean8, lower8, upper8,
+           is.summary = FALSE,
+           clip=c(-100,100),
+           xlab = "Relative risk difference in percent (95% Confidence interval) between critical care versus ward admission after surgery",
+           title = "30-day mortality",
+           xticks = c(0, 10, 20, 30, 40, 50, -10, -20, -30, -40, -50),
+           col=fpColors(box="red",line="red", summary="red"))
+
+tab_model(iv_mort30_proc16, transform = NULL)
+
+```
+
+# Sensitivty analyses: ASA score {.tabset}
+
+```{r, eval=FALSE}
+patients_clean5_asahigh <- patients_clean5 %>% filter(asa == 2)
+patients_clean5_asahigh$gcs_low <- as.numeric(patients_clean5_asahigh$gcs_low)
+patients_clean5_asahigh$polytr <- as.numeric(patients_clean5_asahigh$polytr)
+patients_clean5_asahigh$asa <- as.numeric(patients_clean5_asahigh$asa)
+
+patients_clean5_asamedium <- patients_clean5 %>% filter(asa == 1)
+patients_clean5_asamedium$gcs_low <- as.numeric(patients_clean5_asamedium$gcs_low)
+patients_clean5_asamedium$polytr <- as.numeric(patients_clean5_asamedium$polytr)
+patients_clean5_asamedium$asa <- as.numeric(patients_clean5_asamedium$asa)
+
+patients_clean5_asalow <- patients_clean5 %>% filter(asa == 0)
+patients_clean5_asalow$gcs_low <- as.numeric(patients_clean5_asalow$gcs_low)
+patients_clean5_asalow$polytr <- as.numeric(patients_clean5_asalow$polytr)
+patients_clean5_asalow$asa <- as.numeric(patients_clean5_asalow$asa)
+
+# Forest plot ASA
+mean9 <-  c(NA, -17, -9, 1)
+lower9 <- c(NA, -75, -30, -6)
+upper9 <- c(NA, 31, 13, 8)
+
+tabletext9 <- cbind(c("ASA score", "ASA 4 or 5", "ASA 3", "ASA 1 or 2"))
+
+forestplot(tabletext9, mean9, lower9, upper9,
+           is.summary = FALSE,
+           clip=c(-100,100),
+           xlab = "Relative risk difference in percent (95% Confidence interval) between critical care versus ward admission after surgery",
+           title = "30-day mortality",
+           xticks = c(0, 10, 20, 30, 40, -10, -20, -30, -40, -50, -60, -70, -80),
+           col=fpColors(box="red",line="red", summary="red"))
+
+tab_model(iv_mort30_asalow, transform = NULL)
+
+```
+
+# Sensitivity analyses: Age {.tabset}
+
+```{r, eval=FALSE}
+patients_clean5_ageover75 <- patients_clean5 %>% filter(age >= 75)
+patients_clean5_ageover75$gcs <- as.numeric(patients_clean5_ageover75$gcs_low)
+patients_clean5_ageover75$polytr <- as.numeric(patients_clean5_ageover75$polytr)
+patients_clean5_ageover75$asa <- as.numeric(patients_clean5_ageover75$asa)
+
+patients_clean5_ageunder75 <- patients_clean5 %>% filter(age < 75)
+
+patients_clean5_ageover65 <- patients_clean5 %>% filter(age >= 65)
+patients_clean5_ageunder65 <- patients_clean5 %>% filter(age < 65)
+
+# Forest plot age
+mean9 <-  c(NA, 0, -10, -10, -10)
+lower9 <- c(NA, -24, -19, -27, -21)
+upper9 <- c(NA, 25, -1, 8, 0)
+
+tabletext9 <- cbind(c("Age", ">75", "<75", ">65", "<65"))
+
+forestplot(tabletext9, mean9, lower9, upper9,
+           is.summary = FALSE,
+           clip=c(-100,100),
+           xlab = "Relative risk difference in percent (95% Confidence interval) between critical care versus ward admission after surgery",
+           title = "30-day mortality",
+           xticks = c(0, 10, 20, 30, -10, -20, -30),
+           col=fpColors(box="red",line="red", summary="red"))
+
+tab_model(iv_mort30_ageover75, transform = NULL)
+
+```
+
+# Sensitivty analyses: POSSUM {.tabset}
+
+## Creating POSSUM data
+
+```{r, eval=FALSE}
+#Drop missing SORT
+possum_mis <- which(!complete.cases(patients_clean5$pPOSSUM_mort))
+sum(is.na(patients_clean5$possum_mis))
+
+#Create normal SORT variable
+library(arm)
+patients_clean5$possum_mort_normal <- invlogit(patients_clean5$pPOSSUM_mort) * 100
+```
+
+# Sensitivty analyses: POSSUM {.tabset}
+
+## Creating POSSUM data
+
+```{r, eval=FALSE}
+#Drop missing SORT
+possum_mis <- which(!complete.cases(patients_clean5$pPOSSUM_mort))
+sum(is.na(patients_clean5$pPOSSUM_mort))
+
+#Create normal SORT variable
+library(arm)
+patients_clean5$possum_mort_normal <- invlogit(patients_clean5$pPOSSUM_mort) * 100
+
+patients_clean5_possum1 <- patients_clean5 %>% filter(possum_mort_normal >1)
+patients_clean5_possum2 <- patients_clean5 %>% filter(possum_mort_normal >2)
+patients_clean5_possum3 <- patients_clean5 %>% filter(possum_mort_normal >3)
+patients_clean5_possum4 <- patients_clean5 %>% filter(possum_mort_normal >4)
+patients_clean5_possum5 <- patients_clean5 %>% filter(possum_mort_normal >5)
+patients_clean5_possum6 <- patients_clean5 %>% filter(possum_mort_normal >6)
+patients_clean5_possum7 <- patients_clean5 %>% filter(possum_mort_normal >7)
+patients_clean5_possum8 <- patients_clean5 %>% filter(possum_mort_normal >8)
+patients_clean5_possum9 <- patients_clean5 %>% filter(possum_mort_normal >9)
+
+patients_clean5_possum10 <- patients_clean5 %>% filter(possum_mort_normal >10)
+patients_clean5_possum20 <- patients_clean5 %>% filter(possum_mort_normal > 20)
+patients_clean5_possum30 <- patients_clean5 %>% filter(possum_mort_normal > 30)
+
+patients_clean5_possum40 <- patients_clean5 %>% filter(possum_mort_normal > 40)
+patients_clean5_possum40$polytr <- as.numeric(patients_clean5_possum40$polytr)
+
+patients_clean5_possum50 <- patients_clean5 %>% filter(possum_mort_normal > 50)
+patients_clean5_possum50$polytr <- as.numeric(patients_clean5_possum50$polytr)
+
+patients_clean5_possum60 <- patients_clean5 %>% filter(possum_mort_normal > 60)
+patients_clean5_possum60$polytr <- as.numeric(patients_clean5_possum60$polytr)
+patients_clean5_possum60$pulfib <- as.numeric(patients_clean5_possum60$pulfib)
+
+patients_clean5_possum70 <- patients_clean5 %>% filter(possum_mort_normal > 70)
+patients_clean5_possum70$polytr <- as.numeric(patients_clean5_possum70$polytr)
+patients_clean5_possum70$pulfib <- as.numeric(patients_clean5_possum70$pulfib)
+
+patients_clean5_possum80 <- patients_clean5 %>% filter(possum_mort_normal > 80)
+patients_clean5_possum80$polytr <- as.numeric(patients_clean5_possum80$polytr)
+patients_clean5_possum80$pulfib <- as.numeric(patients_clean5_possum80$pulfib)
+patients_clean5_possum80$urg <- as.numeric(patients_clean5_possum80$urg)
+patients_clean5_possum80$demen <- as.numeric(patients_clean5_possum80$demen)
+patients_clean5_possum80$livcirr <- as.numeric(patients_clean5_possum80$livcirr)
+
+patients_clean5_possum90 <- patients_clean5 %>% filter(possum_mort_normal > 90)
+
+# Forest plot POSSUM
+mean12 <-  c(NA, -12, -26, -19, -34, -17, 12, 37)
+lower12 <- c(NA, -68, -90, -69, -115, -107, -238, -49)
+upper12 <- c(NA, 44, 37, 31, 47, 73, 263, 123)
+
+tabletext12 <- cbind(c("POSSUM", ">10%", ">20%", ">30%", ">40%", ">50%", ">60%", ">70%"))
+
+forestplot(tabletext12, mean12, lower12, upper12,
+           is.summary = FALSE,
+           clip=c(-100,100),
+           title = "30-day mortality",
+           xticks = c(-250, -200, -150, -100, -50, 0, 50, 100, 150, 200, 250, 300),
+           xlab = "Risk difference in percent (95% Confidence interval) between critical care versus ward admission after surgery",
+           col=fpColors(box="red",line="red", summary="red"))
+
+
+mean14 <-  c(NA, -34, -29, -13, -34, -18, -8, 37)
+lower14 <- c(NA, -101, -95, -63, -116, -110, -282, -49)
+upper14 <- c(NA, 33, 37, 37, 48, 73, 267, 123)
+
+tabletext14 <- cbind(c("POSSUM", ">10%", ">20%", ">30%", ">40%", ">50%", ">60%", ">70%"))
+
+forestplot(tabletext14, mean14, lower14, upper14,
+           is.summary = FALSE,
+           clip=c(-100,100),
+           title = "60-day mortality",
+           xticks = c(-300, -250, -200, -150, -100, -50, 0, 50, 100, 150, 200, 250, 300),
+           xlab = "Risk difference in percent (95% Confidence interval) between critical care versus ward admission after surgery",
+           col=fpColors(box="red",line="red", summary="red"))
+
+tab_model(iv_mort60_possum70)
+
+
+
+
+mean15 <-  c(NA, -14, -13, -14, -20, -24, -10, -27, -20, -11, -12)
+lower15 <- c(NA, -30, -33, -37, -52, -57, -38, -73, -61, -54, -68)
+upper15 <- c(NA, 1, 6, 9, 12, 9, 17, 19, 21, 33, 44)
+
+tabletext15 <- cbind(c("POSSUM", ">1%", ">2%", ">3%", ">4%", ">5%", ">6%", ">7%", ">8%", ">9%", ">10%"))
+
+forestplot(tabletext15, mean15, lower15, upper15,
+           is.summary = FALSE,
+           clip=c(-100,100),
+           title = "30-day mortality",
+           xticks = c(-100, -50, 0, 50),
+           xlab = "Risk difference in percent (95% Confidence interval) between critical care versus ward admission after surgery",
+           col=fpColors(box="red",line="red", summary="red"))
+
+
+mean16 <-  c(NA, -16, -19, -18, -24, -28, -16, -37, -30, -28, -34)
+lower16 <- c(NA, .32, -40, -43, -58, -64, -46, -89, -75, -79, -101)
+upper16 <- c(NA, 1, 3, 7, 10, 7, 14, 15, 16, 22, 33)
+
+tabletext16 <- cbind(c("POSSUM", ">1%", ">2%", ">3%", ">4%", ">5%", ">6%", ">7%", ">8%", ">9%", ">10%"))
+
+forestplot(tabletext16, mean16, lower16, upper16,
+           is.summary = FALSE,
+           clip=c(-100,100),
+           title = "60-day mortality",
+           xticks = c(-110,- 100, -50, 0, 50),
+           xlab = "Risk difference in percent (95% Confidence interval) between critical care versus ward admission after surgery",
+           col=fpColors(box="red",line="red", summary="red"))
+
+tab_model(iv_mort60_possum10)
+
+
+```
+
+
+# Instrumental variable for all sub-cohorts {.tabset}
+
+```{r, eval=FALSE}
+library(AER)
+library(systemfit)
+```
+
+
+```{r, eval=FALSE}
+# Run analyses by putting subcohorts in here
+
+iv_mort60_possum9 <- ivreg(postmort60 ~ icu_adm + S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                           S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                           malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                           S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                           night + anesgrade + surgrade |
+                           
+                           S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                           S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                           malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                           S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                           night + anesgrade + surgrade +
+                           
+                            disready2 + emptybed_cat,
+                         data = patients_clean5_possum9)
+```
+
+
+```{r, eval=FALSE}
+summary(iv_mort30_sort8)
+cbind(OR = coef(iv_mort30_sort1), confint(iv_mort30_sort1))
+```
+
+```{r, eval=FALSE}
+tab_model(iv_mort30_sort_under1,iv_mort30_sort_over1, transform = NULL)
+```
+
+
+# Occupancy data quality check {.tabset}
+
+## Reporting sites
+
+**How many sites have reported data?**
+
+251 sites reported occupancy data.
+274 sites are in the startin cohort (before dropping cases).
+
+```{r, eval=FALSE}
+unique(occupancy$SiteCode)
+unique(patients_clean$SiteCode)
+
+```
+
+## Extremes 8AM
+
+**Is the total ICU bed number (treated patients + empty beds + discharge-ready patients) reasonable?**
+
+```{r}
+qplot(occupancy$TotalCapacity0800, geom = "histogram", binwidth = 1)
+```
+
+```{r}
+summary(occupancy$TotalCapacity0800) #certain sites have more than 60 beds total capacity
+```
+
+Sites with total ICU beds >60
+```{r}
+totalbed8_over60 <- occupancy %>% filter(TotalCapacity0800 >= 60)%>% group_by(SiteCode) %>% summarise(freq=n()) %>% arrange(desc(freq))
+knitr::kable(totalbed8_over60, format = "markdown")
+```
+
+Let's look at these sites. These are not extreme values. These hospital have large ICUs.
+
+```{r}
+totalbed_extreme13 <- occupancy %>% filter(SiteCode == "RJZ01") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme13, format = "markdown")
+
+totalbed_extreme14 <- occupancy %>% filter(SiteCode == "RRK15") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme14, format = "markdown")
+
+totalbed_extreme15 <- occupancy %>% filter(SiteCode == "RJE01") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme15, format = "markdown")
+
+totalbed_extreme16 <- occupancy %>% filter(SiteCode == "RJ701") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme16, format = "markdown")
+
+totalbed_extreme17 <- occupancy %>% filter(SiteCode == "RGT01") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme17, format = "markdown")
+
+totalbed_extreme18 <- occupancy %>% filter(SiteCode == "RHM01") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme18, format = "markdown")
+```
+
+Sites with total ICU beds <3
+```{r}
+totalbed8_under3 <- occupancy %>% filter(TotalCapacity0800 <3)%>% group_by(SiteCode) %>% summarise(freq=n()) %>% arrange(desc(freq))
+knitr::kable(totalbed8_under3, format = "markdown")
+```
+
+Let's look at these sites. These are not extreme values. These hospital have small ICUs.
+
+```{r}
+totalbed_extreme19 <- occupancy %>% filter(SiteCode == "RHM12") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme19, format = "markdown")
+
+totalbed_extreme20 <- occupancy %>% filter(SiteCode == "Z102H") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme20, format = "markdown")
+
+totalbed_extreme21 <- occupancy %>% filter(SiteCode == "RYJ04") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme21, format = "markdown")
+
+totalbed_extreme22 <- occupancy %>% filter(SiteCode == "MERCY") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme22, format = "markdown")
+
+totalbed_extreme23 <- occupancy %>% filter(SiteCode == "RR109") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme23, format = "markdown")
+
+totalbed_extreme24 <- occupancy %>% filter(SiteCode == "C313H") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme24, format = "markdown")
+
+totalbed_extreme25 <- occupancy %>% filter(SiteCode == "RALC7") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme25, format = "markdown")
+
+totalbed_extreme26 <- occupancy %>% filter(SiteCode == "RCX70") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(totalbed_extreme26, format = "markdown")
+```
+
+
+## Extremes 8PM
+
+**Is the total ICU bed number (treated patients + empty beds + discharge-ready patients) reasonable?**
+
+
+```{r}
+qplot(occupancy$TotalCapacity2000, geom = "histogram", binwidth = 1)
+```
+
+```{r}
+summary(occupancy$TotalCapacity2000) #certain sites have more than 60 beds total capacity
+```
+
+Sites with total ICU beds >60
+```{r}
+totalbed20_over60 <- occupancy %>% filter(TotalCapacity2000 >= 60)%>% group_by(SiteCode) %>% summarise(freq=n()) %>% arrange(desc(freq))
+knitr::kable(totalbed20_over60, format = "markdown")
+```
+
+Let's look at these sites. These are not extreme values. These hospital have large ICUs.
+
+```{r}
+totalbed_extreme1 <- occupancy %>% filter(SiteCode == "RJZ01") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(totalbed_extreme1, format = "markdown")
+
+totalbed_extreme2 <- occupancy %>% filter(SiteCode == "RRK15") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(totalbed_extreme2, format = "markdown")
+
+totalbed_extreme3 <- occupancy %>% filter(SiteCode == "RJE01") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(totalbed_extreme3, format = "markdown")
+
+totalbed_extreme4 <- occupancy %>% filter(SiteCode == "RGT01") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(totalbed_extreme4, format = "markdown")
+
+totalbed_extreme5 <- occupancy %>% filter(SiteCode == "RHM01") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(totalbed_extreme5, format = "markdown")
+
+totalbed_extreme6 <- occupancy %>% filter(SiteCode == "RJ701") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(totalbed_extreme6, format = "markdown")
+```
+
+
+Sites with total ICU beds <3
+```{r}
+totalbed20_under3 <- occupancy %>% filter(TotalCapacity2000 <3) %>% group_by(SiteCode) %>% summarise(freq=n()) %>% arrange(desc(freq))
+knitr::kable(totalbed20_under3, format = "markdown")
+```
+
+Let's look at these sites. These are not extreme values. These hospital have small ICUs.
+
+```{r}
+totalbed_extreme7 <- occupancy %>% filter(SiteCode == "RHM12") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(totalbed_extreme7, format = "markdown")
+
+totalbed_extreme8 <- occupancy %>% filter(SiteCode == "Z102H") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(totalbed_extreme8, format = "markdown")
+
+totalbed_extreme9 <- occupancy %>% filter(SiteCode == "RYJ04") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(totalbed_extreme9, format = "markdown")
+
+totalbed_extreme10 <- occupancy %>% filter(SiteCode == "MERCY") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(totalbed_extreme10, format = "markdown")
+
+totalbed_extreme11 <- occupancy %>% filter(SiteCode == "RALC7") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(totalbed_extreme11, format = "markdown")
+
+totalbed_extreme12 <- occupancy %>% filter(SiteCode == "RR109") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(totalbed_extreme12, format = "markdown")
+```
+
+
+## Zero beds
+
+**Are there sites with 0 total ICU beds (0 treated patients + 0 free beds + 0 dischargeable patients)?**
+
+These sites have 0 total ICU beds. Were these ICUs closed?
+
+```{r}
+occupancy_icuclosed <- occupancy %>% filter(occupancy$TotalCapacity0800 == 0 | occupancy$TotalCapacity2000 == 0) %>% group_by(SiteCode) %>% summarise(freq=n()) %>% arrange(desc(freq))
+
+knitr::kable(occupancy_icuclosed, format = "markdown")
+```
+
+```{r}
+totalbed_zero1 <- occupancy %>% filter(SiteCode == "RALC7") %>% select(SiteCode, StudyDay, TotalCapacity0800, TotalCapacity2000)
+knitr::kable(totalbed_zero1, format = "markdown")
+
+totalbed_zero2 <- occupancy %>% filter(SiteCode == "C313H") %>% select(SiteCode, StudyDay, TotalCapacity0800, TotalCapacity2000)
+knitr::kable(totalbed_zero2, format = "markdown")
+
+totalbed_zero3 <- occupancy %>% filter(SiteCode == "MERCY") %>% select(SiteCode, StudyDay, TotalCapacity0800, TotalCapacity2000)
+knitr::kable(totalbed_zero3, format = "markdown")
+
+totalbed_zero4 <- occupancy %>% filter(SiteCode == "RHM12") %>% select(SiteCode, StudyDay, TotalCapacity0800, TotalCapacity2000)
+knitr::kable(totalbed_zero4, format = "markdown")
+
+totalbed_zero5 <- occupancy %>% filter(SiteCode == "RYJ04") %>% select(SiteCode, StudyDay, TotalCapacity0800, TotalCapacity2000)
+knitr::kable(totalbed_zero5, format = "markdown")
+```
+
+## Morning vs. evening
+
+**Look if sites had more dischargeable patients in the morning than in the evening**
+
+```{r}
+occupancy <- occupancy %>% mutate(dis_diff = occupancy$DischargeReady0800 - occupancy$DischargeReady2000)
+summary(occupancy$dis_diff)
+```
+
+Sites with >5 discharge-ready patients in the evening than in the morning
+
+```{r}
+occupancy_dis_exreme_min <- occupancy %>% filter(occupancy$dis_diff <= -5) %>% select(SiteCode, StudyDay,
+                                       DischargeReady0800, DischargeReady2000, dis_diff) %>% arrange(desc(dis_diff))
+#Drop sites that have 5 more patients in the evening than in the morning
+knitr::kable(occupancy_dis_exreme_min, format = "markdown")
+```
+
+
+## Day-to-day fluctuation 8AM: Total ICU beds
+
+**Look into day-to-day difference of total ICU beds (treated patients + empty beds + discharge-ready patients). Any strong fluctuations?**
+
+```{r}
+diff_MonTue <- occupancy %>% filter(StudyDay %in% c("Mon", "Tue")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity0800) - min(TotalCapacity0800))/max(TotalCapacity0800))
+diff_MonTue <- diff_MonTue %>% filter(difference >= 0.5)
+
+diff_TueWed <- occupancy %>% filter(StudyDay %in% c("Tue", "Wed")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity0800) - min(TotalCapacity0800))/max(TotalCapacity0800))
+diff_TueWed <- diff_TueWed %>% filter(difference >= 0.5)
+
+diff_WedThu <- occupancy %>% filter(StudyDay %in% c("Wed", "Thu")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity0800) - min(TotalCapacity0800))/max(TotalCapacity0800))
+diff_WedThu <- diff_WedThu %>% filter(difference >= 0.5)
+
+diff_ThuFri <- occupancy %>% filter(StudyDay %in% c("Thu", "Fri")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity0800) - min(TotalCapacity0800))/max(TotalCapacity0800))
+diff_ThuFri <- diff_ThuFri %>% filter(difference >= 0.5)
+
+diff_FriSat <- occupancy %>% filter(StudyDay %in% c("Fri", "Sat")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity0800) - min(TotalCapacity0800))/max(TotalCapacity0800))
+diff_FriSat <- diff_FriSat %>% filter(difference >= 0.5)
+
+diff_SatSun <- occupancy %>% filter(StudyDay %in% c("Sat", "Sun")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity0800) - min(TotalCapacity0800))/max(TotalCapacity0800))
+diff_SatSun <- diff_SatSun %>% filter(difference >=0.5)
+
+diff_SunMon <- occupancy %>% filter(StudyDay %in% c("Sun", "Mon")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity0800) - min(TotalCapacity0800))/max(TotalCapacity0800))
+diff_SunMon <- diff_SunMon %>% filter(difference >= 0.5)
+```
+
+Sites with >50% change in total ICU beds from one day to another
+```{r}
+diff_total <- rbind(diff_MonTue, diff_TueWed, diff_WedThu, diff_ThuFri, diff_FriSat, diff_SatSun, diff_SunMon)
+diff_total2 <- diff_total %>% group_by(SiteCode)  %>% summarise(freq=n()) %>% arrange(desc(freq))
+knitr::kable(diff_total2, format = "markdown") #Only sites with 1 or 2 cases
+```
+
+Let's look into these sites
+```{r}
+occ_fluct_most1 <- occupancy %>% filter(SiteCode == "C313H") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+
+knitr::kable(occ_fluct_most1, format = "markdown")
+plot(occ_fluct_most1$StudyDay, occ_fluct_most1$TotalCapacity0800, xlab="Day", ylab="Total ICU beds", type = "p")
+
+occ_fluct_most2 <- occupancy %>% filter(SiteCode == "MERCY") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(occ_fluct_most2, format = "markdown")
+plot(occ_fluct_most2$StudyDay, occ_fluct_most2$TotalCapacity0800, xlab="Day", ylab="Total ICU beds", type = "p")
+
+occ_fluct_most3 <- occupancy %>% filter(SiteCode == "RCX70") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(occ_fluct_most3, format = "markdown")
+plot(occ_fluct_most3$StudyDay, occ_fluct_most3$TotalCapacity0800, xlab="Day", ylab="Total ICU beds", type = "p")
+
+occ_fluct_most4 <- occupancy %>% filter(SiteCode == "RFRPA") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(occ_fluct_most4, format = "markdown")
+plot(occ_fluct_most4$StudyDay, occ_fluct_most4$TotalCapacity0800, xlab="Day", ylab="Total ICU beds", type = "p")
+
+occ_fluct_most5 <- occupancy %>% filter(SiteCode == "RJF02") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(occ_fluct_most5, format = "markdown")
+plot(occ_fluct_most5$StudyDay, occ_fluct_most5$TotalCapacity0800, xlab="Day", ylab="Total ICU beds", type = "p")
+
+occ_fluct_most6 <- occupancy %>% filter(SiteCode == "RYJ04") %>% select(SiteCode, StudyDay, TotalCapacity0800)
+knitr::kable(occ_fluct_most6, format = "markdown")
+plot(occ_fluct_most6$StudyDay, occ_fluct_most6$TotalCapacity0800, xlab="Day", ylab="Total ICU beds", type = "p")
+```
+
+
+## Day-to-day fluctuation 8PM: Total ICU beds
+
+**Look into day-to-day difference of total ICU beds (treated patients + empty beds + discharge-ready patients). Any strong fluctuations?**
+
+```{r}
+diff_MonTue2 <- occupancy %>% filter(StudyDay %in% c("Mon", "Tue")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity2000) - min(TotalCapacity2000))/max(TotalCapacity2000))
+diff_MonTue2 <- diff_MonTue2 %>% filter(difference >= 0.5)
+
+diff_TueWed2 <- occupancy %>% filter(StudyDay %in% c("Tue", "Wed")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity2000) - min(TotalCapacity2000))/max(TotalCapacity2000))
+diff_TueWed2 <- diff_TueWed2 %>% filter(difference >= 0.5)
+
+diff_WedThu2 <- occupancy %>% filter(StudyDay %in% c("Wed", "Thu")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity2000) - min(TotalCapacity2000))/max(TotalCapacity2000))
+diff_WedThu2 <- diff_WedThu2 %>% filter(difference >= 0.5)
+
+diff_ThuFri2 <- occupancy %>% filter(StudyDay %in% c("Thu", "Fri")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity2000) - min(TotalCapacity2000))/max(TotalCapacity2000))
+diff_ThuFri2 <- diff_ThuFri2 %>% filter(difference >= 0.5)
+
+diff_FriSat2 <- occupancy %>% filter(StudyDay %in% c("Fri", "Sat")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity2000) - min(TotalCapacity2000))/max(TotalCapacity2000))
+diff_FriSat2 <- diff_FriSat2 %>% filter(difference >= 0.5)
+
+diff_SatSun2 <- occupancy %>% filter(StudyDay %in% c("Sat", "Sun")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity2000) - min(TotalCapacity2000))/max(TotalCapacity2000))
+diff_SatSun2 <- diff_SatSun2 %>% filter(difference >=0.5)
+
+diff_SunMon2 <- occupancy %>% filter(StudyDay %in% c("Sun", "Mon")) %>% group_by(SiteCode) %>% summarise(difference = (max(TotalCapacity2000) - min(TotalCapacity2000))/max(TotalCapacity2000))
+diff_SunMon2 <- diff_SunMon2 %>% filter(difference >= 0.5)
+
+diff_total20 <- rbind(diff_MonTue2, diff_TueWed2, diff_WedThu2, diff_ThuFri2, diff_FriSat2, diff_SatSun2, diff_SunMon2)
+
+diff_total20_2 <- diff_total20  %>% group_by(SiteCode)  %>% summarise(freq=n()) %>% arrange(desc(freq))
+knitr::kable(diff_total20_2, format = "markdown")
+```
+
+Let's look into these sites
+```{r}
+occ_fluct_most7 <- occupancy %>% filter(SiteCode == "MERCY") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(occ_fluct_most7, format = "markdown")
+plot(occ_fluct_most7$StudyDay, occ_fluct_most7$TotalCapacity2000, xlab="Day", ylab="Total ICU beds", type = "p")
+
+occ_fluct_most8 <- occupancy %>% filter(SiteCode == "RHM12") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(occ_fluct_most8, format = "markdown")
+plot(occ_fluct_most8$StudyDay, occ_fluct_most8$TotalCapacity2000, xlab="Day", ylab="Total ICU beds", type = "p")
+
+occ_fluct_most9 <- occupancy %>% filter(SiteCode == "RYJ04") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(occ_fluct_most9, format = "markdown")
+plot(occ_fluct_most9$StudyDay, occ_fluct_most9$TotalCapacity2000, xlab="Day", ylab="Total ICU beds", type = "p")
+
+occ_fluct_most10 <- occupancy %>% filter(SiteCode == "RALC7") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(occ_fluct_most10, format = "markdown")
+plot(occ_fluct_most10$StudyDay, occ_fluct_most10$TotalCapacity2000, xlab="Day", ylab="Total ICU beds", type = "p")
+
+occ_fluct_most11 <- occupancy %>% filter(SiteCode == "RBD01") %>% select(SiteCode, StudyDay, TotalCapacity2000)
+knitr::kable(occ_fluct_most11, format = "markdown")
+plot(occ_fluct_most11$StudyDay, occ_fluct_most11$TotalCapacity2000, xlab="Day", ylab="Total ICU beds", type = "p")
+
+```
+
+## Day-to-day fluctuation 8AM: Empty beds
+
+**Look into day-to-day difference of total ICU beds. Any strong fluctuations?**
+
+```{r}
+diff_MonTue3 <- occupancy %>% filter(StudyDay %in% c("Mon", "Tue")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds0800) - min(EmptyBeds0800))/max(EmptyBeds0800))
+diff_MonTue3 <- diff_MonTue3 %>% filter(difference >= 0.5)
+
+diff_TueWed3 <- occupancy %>% filter(StudyDay %in% c("Tue", "Wed")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds0800) - min(EmptyBeds0800))/max(EmptyBeds0800))
+diff_TueWed3 <- diff_TueWed3 %>% filter(difference >= 0.5)
+
+diff_WedThu3 <- occupancy %>% filter(StudyDay %in% c("Wed", "Thu")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds0800) - min(EmptyBeds0800))/max(EmptyBeds0800))
+diff_WedThu3 <- diff_WedThu3 %>% filter(difference >= 0.5)
+
+diff_ThuFri3 <- occupancy %>% filter(StudyDay %in% c("Thu", "Fri")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds0800) - min(EmptyBeds0800))/max(EmptyBeds0800))
+diff_ThuFri3 <- diff_ThuFri3 %>% filter(difference >= 0.5)
+
+diff_FriSat3 <- occupancy %>% filter(StudyDay %in% c("Fri", "Sat")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds0800) - min(EmptyBeds0800))/max(EmptyBeds0800))
+diff_FriSat3 <- diff_FriSat3 %>% filter(difference >= 0.5)
+
+diff_SatSun3 <- occupancy %>% filter(StudyDay %in% c("Sat", "Sun")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds0800) - min(EmptyBeds0800))/max(EmptyBeds0800))
+diff_SatSun3 <- diff_SatSun3 %>% filter(difference >=0.5)
+
+diff_SunMon3 <- occupancy %>% filter(StudyDay %in% c("Sun", "Mon")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds0800) - min(EmptyBeds0800))/max(EmptyBeds0800))
+diff_SunMon3 <- diff_SunMon3 %>% filter(difference >= 0.5)
+```
+
+Sites with >50% change in total ICU beds from one day to another
+```{r}
+diff_total_8emp <- rbind(diff_MonTue3, diff_TueWed3, diff_WedThu3, diff_ThuFri3, diff_FriSat3, diff_SatSun3, diff_SunMon3)
+diff_total_8emp2 <- diff_total_8emp %>% group_by(SiteCode)  %>% summarise(freq=n()) %>% arrange(desc(freq))
+knitr::kable(diff_total_8emp2, format = "markdown")
+```
+
+Let's look into these sites
+```{r, eval=FALSE}
+```
+
+
+## Day-to-day fluctuation 8PM: Empty beds
+
+**Look into day-to-day difference of total ICU beds. Any strong fluctuations?**
+
+```{r}
+diff_MonTue4 <- occupancy %>% filter(StudyDay %in% c("Mon", "Tue")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds2000) - min(EmptyBeds2000))/max(EmptyBeds2000))
+diff_MonTue4 <- diff_MonTue4 %>% filter(difference >= 0.5)
+
+diff_TueWed4 <- occupancy %>% filter(StudyDay %in% c("Tue", "Wed")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds2000) - min(EmptyBeds2000))/max(EmptyBeds2000))
+diff_TueWed4 <- diff_TueWed4 %>% filter(difference >= 0.5)
+
+diff_WedThu4 <- occupancy %>% filter(StudyDay %in% c("Wed", "Thu")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds2000) - min(EmptyBeds2000))/max(EmptyBeds2000))
+diff_WedThu4 <- diff_WedThu4 %>% filter(difference >= 0.5)
+
+diff_ThuFri4 <- occupancy %>% filter(StudyDay %in% c("Thu", "Fri")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds2000) - min(EmptyBeds2000))/max(EmptyBeds2000))
+diff_ThuFri4 <- diff_ThuFri4 %>% filter(difference >= 0.5)
+
+diff_FriSat4 <- occupancy %>% filter(StudyDay %in% c("Fri", "Sat")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds2000) - min(EmptyBeds2000))/max(EmptyBeds2000))
+diff_FriSat4 <- diff_FriSat4 %>% filter(difference >= 0.5)
+
+diff_SatSun4 <- occupancy %>% filter(StudyDay %in% c("Sat", "Sun")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds2000) - min(EmptyBeds2000))/max(EmptyBeds2000))
+diff_SatSun4 <- diff_SatSun4 %>% filter(difference >=0.5)
+
+diff_SunMon4 <- occupancy %>% filter(StudyDay %in% c("Sun", "Mon")) %>% group_by(SiteCode) %>% summarise(difference = (max(EmptyBeds2000) - min(EmptyBeds2000))/max(EmptyBeds2000))
+diff_SunMon4 <- diff_SunMon4 %>% filter(difference >= 0.5)
+
+diff_total_20emp <- rbind(diff_MonTue4, diff_TueWed4, diff_WedThu4, diff_ThuFri4, diff_FriSat4, diff_SatSun4, diff_SunMon4)
+diff_total_20emp2 <- diff_total_20emp %>% group_by(SiteCode)  %>% summarise(freq=n()) %>% arrange(desc(freq))
+knitr::kable(diff_total_20emp2, format = "markdown")
+```
+
+Let's look into these sites
+```{r, eval=FALSE}
+```
+
+## Day-to-day fluctuation 8AM: Discharge-ready patients
+
+**Look into day-to-day difference of discharge-ready patients. Any strong fluctuations?**
+
+```{r}
+diff_MonTue5 <- occupancy %>% filter(StudyDay %in% c("Mon", "Tue")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady0800) - min(DischargeReady0800))/max(DischargeReady0800))
+diff_MonTue5 <- diff_MonTue5 %>% filter(difference >= 0.5)
+
+diff_TueWed5 <- occupancy %>% filter(StudyDay %in% c("Tue", "Wed")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady0800) - min(DischargeReady0800))/max(DischargeReady0800))
+diff_TueWed5 <- diff_TueWed5 %>% filter(difference >= 0.5)
+
+diff_WedThu5 <- occupancy %>% filter(StudyDay %in% c("Wed", "Thu")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady0800) - min(DischargeReady0800))/max(DischargeReady0800))
+diff_WedThu5 <- diff_WedThu5 %>% filter(difference >= 0.5)
+
+diff_ThuFri5 <- occupancy %>% filter(StudyDay %in% c("Thu", "Fri")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady0800) - min(DischargeReady0800))/max(DischargeReady0800))
+diff_ThuFri5 <- diff_ThuFri5 %>% filter(difference >= 0.5)
+
+diff_FriSat5 <- occupancy %>% filter(StudyDay %in% c("Fri", "Sat")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady0800) - min(DischargeReady0800))/max(DischargeReady0800))
+diff_FriSat5 <- diff_FriSat5 %>% filter(difference >= 0.5)
+
+diff_SatSun5 <- occupancy %>% filter(StudyDay %in% c("Sat", "Sun")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady0800) - min(DischargeReady0800))/max(DischargeReady0800))
+diff_SatSun5 <- diff_SatSun5 %>% filter(difference >=0.5)
+
+diff_SunMon5 <- occupancy %>% filter(StudyDay %in% c("Sun", "Mon")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady0800) - min(DischargeReady0800))/max(DischargeReady0800))
+diff_SunMon5 <- diff_SunMon5 %>% filter(difference >= 0.5)
+
+diff_total_8dis <- rbind(diff_MonTue5, diff_TueWed5, diff_WedThu5, diff_ThuFri5, diff_FriSat5, diff_SatSun5, diff_SunMon5)
+diff_total_8dis2 <- diff_total_8dis %>% group_by(SiteCode)  %>% summarise(freq=n()) %>% arrange(desc(freq))
+knitr::kable(diff_total_8dis2, format = "markdown")
+
+```
+
+Let's look into these sites
+```{r, eval=FALSE}
+```
+
+
+## Day-to-day fluctuation 8PM: Discharge-ready patient
+
+**Look into day-to-day difference of discharge-ready patient. Any strong fluctuations?**
+
+```{r}
+diff_MonTue6 <- occupancy %>% filter(StudyDay %in% c("Mon", "Tue")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady2000) - min(DischargeReady2000))/max(DischargeReady2000))
+diff_MonTue6 <- diff_MonTue6 %>% filter(difference >= 0.5)
+
+diff_TueWed6 <- occupancy %>% filter(StudyDay %in% c("Tue", "Wed")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady2000) - min(DischargeReady2000))/max(DischargeReady2000))
+diff_TueWed6 <- diff_TueWed6 %>% filter(difference >= 0.5)
+
+diff_WedThu6 <- occupancy %>% filter(StudyDay %in% c("Wed", "Thu")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady2000) - min(DischargeReady2000))/max(DischargeReady2000))
+diff_WedThu6 <- diff_WedThu6 %>% filter(difference >= 0.5)
+
+diff_ThuFri6 <- occupancy %>% filter(StudyDay %in% c("Thu", "Fri")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady2000) - min(DischargeReady2000))/max(DischargeReady2000))
+diff_ThuFri6 <- diff_ThuFri6 %>% filter(difference >= 0.5)
+
+diff_FriSat6 <- occupancy %>% filter(StudyDay %in% c("Fri", "Sat")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady2000) - min(DischargeReady2000))/max(DischargeReady2000))
+diff_FriSat6 <- diff_FriSat6 %>% filter(difference >= 0.5)
+
+diff_SatSun6 <- occupancy %>% filter(StudyDay %in% c("Sat", "Sun")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady2000) - min(DischargeReady2000))/max(DischargeReady2000))
+diff_SatSun6 <- diff_SatSun6 %>% filter(difference >=0.5)
+
+diff_SunMon6 <- occupancy %>% filter(StudyDay %in% c("Sun", "Mon")) %>% group_by(SiteCode) %>% summarise(difference = (max(DischargeReady2000) - min(DischargeReady2000))/max(DischargeReady2000))
+diff_SunMon6 <- diff_SunMon6 %>% filter(difference >= 0.5)
+
+diff_total_20dis <- rbind(diff_MonTue6, diff_TueWed6, diff_WedThu6, diff_ThuFri6, diff_FriSat6, diff_SatSun6, diff_SunMon6)
+diff_total_20dis2 <- diff_total_20dis %>% group_by(SiteCode)  %>% summarise(freq=n()) %>% arrange(desc(freq))
+knitr::kable(diff_total_20dis2, format = "markdown")
+```
+
+Let's look into these sites
+```{r, eval=FALSE}
+```
+
+## Day-to-day fluctuation 8AM: Treated patient
+
+**Look into day-to-day difference of treated patients. Any strong fluctuations?**
+
+```{r}
+diff_MonTue7 <- occupancy %>% filter(StudyDay %in% c("Mon", "Tue")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated0800) - min(Treated0800))/max(Treated0800))
+diff_MonTue7 <- diff_MonTue7 %>% filter(difference >= 0.5)
+
+diff_TueWed7 <- occupancy %>% filter(StudyDay %in% c("Tue", "Wed")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated0800) - min(Treated0800))/max(Treated0800))
+diff_TueWed7 <- diff_TueWed7 %>% filter(difference >= 0.5)
+
+diff_WedThu7 <- occupancy %>% filter(StudyDay %in% c("Wed", "Thu")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated0800) - min(Treated0800))/max(Treated0800))
+diff_WedThu7 <- diff_WedThu7 %>% filter(difference >= 0.5)
+
+diff_ThuFri7 <- occupancy %>% filter(StudyDay %in% c("Thu", "Fri")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated0800) - min(Treated0800))/max(Treated0800))
+diff_ThuFri7 <- diff_ThuFri7 %>% filter(difference >= 0.5)
+
+diff_FriSat7 <- occupancy %>% filter(StudyDay %in% c("Fri", "Sat")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated0800) - min(Treated0800))/max(Treated0800))
+diff_FriSat7 <- diff_FriSat7 %>% filter(difference >= 0.5)
+
+diff_SatSun7 <- occupancy %>% filter(StudyDay %in% c("Sat", "Sun")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated0800) - min(Treated0800))/max(Treated0800))
+diff_SatSun7 <- diff_SatSun7 %>% filter(difference >=0.5)
+
+diff_SunMon7 <- occupancy %>% filter(StudyDay %in% c("Sun", "Mon")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated0800) - min(Treated0800))/max(Treated0800))
+diff_SunMon7 <- diff_SunMon7 %>% filter(difference >= 0.5)
+
+diff_total_8treat <- rbind(diff_MonTue7, diff_TueWed7, diff_WedThu7, diff_ThuFri7, diff_FriSat7, diff_SatSun7, diff_SunMon7)
+diff_total_8treat2 <- diff_total_8treat %>% group_by(SiteCode)  %>% summarise(freq=n()) %>% arrange(desc(freq))
+knitr::kable(diff_total_8treat2, format = "markdown")
+```
+
+Let's look into these sites
+```{r, eval=FALSE}
+```
+
+
+## Day-to-day fluctuation 8PM: Treated patient
+
+**Look into day-to-day difference of treated patients. Any strong fluctuations?**
+
+```{r}
+diff_MonTue8 <- occupancy %>% filter(StudyDay %in% c("Mon", "Tue")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated2000) - min(Treated2000))/max(Treated2000))
+diff_MonTue8 <- diff_MonTue8 %>% filter(difference >= 0.5)
+
+diff_TueWed8 <- occupancy %>% filter(StudyDay %in% c("Tue", "Wed")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated2000) - min(Treated2000))/max(Treated2000))
+diff_TueWed8 <- diff_TueWed8 %>% filter(difference >= 0.5)
+
+diff_WedThu8 <- occupancy %>% filter(StudyDay %in% c("Wed", "Thu")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated2000) - min(Treated2000))/max(Treated2000))
+diff_WedThu8 <- diff_WedThu8 %>% filter(difference >= 0.5)
+
+diff_ThuFri8 <- occupancy %>% filter(StudyDay %in% c("Thu", "Fri")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated2000) - min(Treated2000))/max(Treated2000))
+diff_ThuFri8 <- diff_ThuFri8 %>% filter(difference >= 0.5)
+
+diff_FriSat8 <- occupancy %>% filter(StudyDay %in% c("Fri", "Sat")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated2000) - min(Treated2000))/max(Treated2000))
+diff_FriSat8 <- diff_FriSat8 %>% filter(difference >= 0.5)
+
+diff_SatSun8 <- occupancy %>% filter(StudyDay %in% c("Sat", "Sun")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated2000) - min(Treated2000))/max(Treated2000))
+diff_SatSun8 <- diff_SatSun8 %>% filter(difference >=0.5)
+
+diff_SunMon8 <- occupancy %>% filter(StudyDay %in% c("Sun", "Mon")) %>% group_by(SiteCode) %>% summarise(difference = (max(Treated2000) - min(Treated2000))/max(Treated2000))
+diff_SunMon8 <- diff_SunMon8 %>% filter(difference >= 0.5)
+
+diff_total_20treat <- rbind(diff_MonTue8, diff_TueWed8, diff_WedThu8, diff_ThuFri8, diff_FriSat8, diff_SatSun8, diff_SunMon8)
+diff_total_20treat2 <- diff_total_20treat %>% group_by(SiteCode)  %>% summarise(freq=n()) %>% arrange(desc(freq))
+knitr::kable(diff_total_20treat2, format = "markdown")
+```
+
+Let's look into these sites
+```{r, eval=FALSE}
+```
+
+
+## Week day vs. weekend 8AM
+
+**Compare mean of discharge-ready patients on week days vs. on the weekend**
+
+```{r}
+mean_weekday <- occupancy %>% filter(StudyDay %in% c("Mon", "Tue", "Wed", "Thu", "Fri")) %>%
+  group_by(SiteCode) %>% summarise(mean_weekday0800=mean(DischargeReady0800))
+  
+mean_weekend <- occupancy %>% filter(StudyDay %in% c("Sat", "Sun")) %>%
+  group_by(SiteCode) %>% summarise(mean_weekend0800=mean(DischargeReady0800))
+
+
+max_weekend <- occupancy %>% filter(StudyDay %in% c("Sat", "Sun")) %>%
+  group_by(SiteCode) %>% summarise(max_weekend0800=max(DischargeReady0800))
+
+means_discharge <- merge(mean_weekday, mean_weekend, by="SiteCode")
+means_discharge <- merge(means_discharge, max_weekend, by="SiteCode")
+
+
+means_discharge$ratio0800 <- (means_discharge$mean_weekday0800/means_discharge$mean_weekend0800)
+means_discharge <- means_discharge %>% filter(ratio0800 < 1) #only select where weekend number > weekday number
+means_discharge$diff0800 <- (means_discharge$mean_weekend0800 - means_discharge$mean_weekday0800)/means_discharge$mean_weekend0800
+means_discharge <- means_discharge %>% filter(diff0800 >= 0.5) %>% arrange(desc(diff0800))
+```
+
+Show sites where >50% discharge-ready patients on the weekend than during the week
+
+```{r}
+knitr::kable(means_discharge, format = "markdown")
+```
+
+## Week day vs. weekend 8PM
+
+**Compare mean of discharge-ready patients on week days vs. on the weekend**
+
+
+```{r}
+mean_weekday2 <- occupancy %>% filter(StudyDay %in% c("Mon", "Tue", "Wed", "Thu", "Fri")) %>%
+  group_by(SiteCode) %>% summarise(mean_weekday2000=mean(DischargeReady2000))
+
+mean_weekend2 <- occupancy %>% filter(StudyDay %in% c("Sat", "Sun")) %>%
+  group_by(SiteCode) %>% summarise(mean_weekend2000=mean(DischargeReady2000))
+
+max_weekend2 <- occupancy %>% filter(StudyDay %in% c("Sat", "Sun")) %>%
+  group_by(SiteCode) %>% summarise(max_weekend2000=max(DischargeReady2000))
+
+means_discharge2 <- merge(mean_weekday2, mean_weekend2, by="SiteCode")
+means_discharge2 <- merge(means_discharge2, max_weekend2, by="SiteCode")
+
+means_discharge2$ratio2000 <- (means_discharge2$mean_weekday2000/means_discharge2$mean_weekend2000)
+means_discharge2 <- means_discharge2 %>% filter(ratio2000 < 1)
+means_discharge2$diff2000 <- (means_discharge2$mean_weekend2000 - means_discharge2$mean_weekday2000)/means_discharge2$mean_weekend2000
+means_discharge2 <- means_discharge2 %>% filter(diff2000 >= 0.5) %>% arrange(desc(diff2000))
+```
+
+Show sites where >50% discharge-ready patients on the weekend than during the week
+
+```{r}
+knitr::kable(means_discharge2, format = "markdown")
+```
+
+# Probit analysis {.tabset}
+
+# Near far matching {.tabset}
+
+```{r}
+
+#Based on manual by package creators: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6207198/
+#trt - treatment group: ICU admission yes or no
+#covs - all covariates from primary multivariable model
+#iv - instruments: "emptybed_cat" (empty beds categorised) AND/OR "disready2" (discharge-ready patients categorised)
+#trt.type = “bin” - treatment variable is binary
+#imp.var = "SiteCode" - prioritise hospital site in matching
+
+library(nearfar)
+
+nearfar <- opt_nearfar(dta = patients_clean5, trt = "icu_adm",
+                      
+                        covs = c("S01Gender", "age_p20", "S02PatientOrigin", "S04ProcedureCount", "urg",
+                                "S02PlannedProcSeverity", "S02PlannedProcSeverity", "asa",
+                                "S04AnaestheticTechniqueGeneral", "S02LevelOfSupport", "S02PreopLOS",
+                                "malig", "radio", "cad", "chf", "stroke", "demen", "copd", "pulfib",
+                                "livcirr", "rend", "diabet", "polytr", "gcs_low", 
+                                "S03SystolicBloodPressureBpAtPreAssessment",
+                                "S03PulseRateAtPreoperativeAssessment", "dyspn", "night",
+                                "anesgrade ", " surgrade"),
+                      
+                        iv = "emptybed_cat", trt.type = "bin", imp.var = "SiteCode")
+
+```
+
+
+# Propensity score matching
+
+```{r}
+library(MatchIt)
+
+# Calulcate PS score
+
+psm_mort30 <- glm(icu_adm ~ S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                          S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                  malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                  S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                  night + anesgrade + surgrade,
+                   family = binomial(),
+                  data = patients_clean5)
+
+summary(psm_mort30)
+
+# Create dataset with matching variables only which have no missing values. Missing values have already been dropped before.
+
+patients_clean5_priormatch <- patients_clean5 %>% select(CaseId, icu_adm, S01Gender , age_p20 , S02PatientOrigin , S04ProcedureCount , urg , S02PlannedProcSeverity , asa , S04AnaestheticTechniqueGeneral , S02LevelOfSupport , S02PreopLOS , malig , radio , cad , chf , stroke , demen , copd , pulfib , livcirr , rend , diabet , polytr , gcs_low , S03SystolicBloodPressureBpAtPreAssessment , S03PulseRateAtPreoperativeAssessment , dyspn , night , anesgrade , surgrade)
+
+psm_mort30_match <- matchit(icu_adm ~ S01Gender + age_p20 + S02PatientOrigin + S04ProcedureCount + urg +
+                          S02PlannedProcSeverity + asa + S04AnaestheticTechniqueGeneral + S02LevelOfSupport + S02PreopLOS +
+                  malig + radio + cad + chf + stroke + demen + copd + pulfib + livcirr + rend + diabet + polytr + gcs_low +
+                  S03SystolicBloodPressureBpAtPreAssessment + S03PulseRateAtPreoperativeAssessment + dyspn +
+                  night + anesgrade + surgrade,
+                  method = "nearest", data = patients_clean5_priormatch)
+
+# Create dataset only with matched patients.
+
+patients_clean5_postmatch <- match.data(psm_mort30_match)
+
+# Create dataset with outcome only.
+
+patients_clean5_outcomes <- patients_clean5 %>% select(CaseId, POMS, postmort30, postmort60)
+
+# Merge dataset with matched patients with outcomes dataset.
+
+patients_clean5_postmatch_withoutcomes <- merge(patients_clean5_postmatch, patients_clean5_outcomes, by = "CaseId")
+
+# Run analyses
+
+log_mort30_match <- glm(postmort30 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes, family = "binomial")
+
+summary(log_mort30_match)
+cbind(Estimate = coef(log_mort30_match), confint(log_mort30_match))
+tab_model(log_mort30_match, transform = NULL)
+
+log_mort60_match <- glm(postmort60 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes, family = "binomial")
+
+summary(log_mort60_match)
+cbind(Estimate = coef(log_mort60_match), confint(log_mort60_match))
+tab_model(log_mort60_match, transform = NULL)
+
+log_poms_match <- glm(POMS ~ icu_adm, data = patients_clean5_postmatch_withoutcomes, family = "binomial")
+
+summary(log_poms_match)
+cbind(Estimate = coef(log_poms_match), confint(log_poms_match))
+tab_model(log_poms_match, transform = NULL)
+
+# Run analyses in tertiles
+
+## Create tertiles
+
+patients_clean5_postmatch_withoutcomes$distance_p33 <- as.ordered(cut2(patients_clean5_postmatch_withoutcomes$distance, g=3))
+
+patients_clean5_postmatch_withoutcomes_tert1 <- patients_clean5_postmatch_withoutcomes %>% filter(distance < 0.133)
+patients_clean5_postmatch_withoutcomes_tert2 <- patients_clean5_postmatch_withoutcomes %>% filter(distance >= 0.1329 & distance < 0.362)
+patients_clean5_postmatch_withoutcomes_tert3 <- patients_clean5_postmatch_withoutcomes %>% filter(distance >= 0.3624)
+
+## Run analyses
+
+log_mort30_match_tert1 <- glm(postmort30 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_tert1, family = "binomial")
+log_mort60_match_tert1 <- glm(postmort60 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_tert1, family = "binomial")
+tab_model(log_mort30_match_tert1, log_mort60_match_tert1)
+
+log_mort30_match_tert2 <- glm(postmort30 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_tert2, family = "binomial")
+log_mort60_match_tert2 <- glm(postmort60 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_tert2, family = "binomial")
+tab_model(log_mort30_match_tert2, log_mort60_match_tert2)
+
+log_mort30_match_tert3 <- glm(postmort30 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_tert3, family = "binomial")
+log_mort60_match_tert3 <- glm(postmort60 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_tert3, family = "binomial")
+tab_model(log_mort30_match_tert3, log_mort60_match_tert3)
+
+# Run analyses in quintiles
+
+patients_clean5_postmatch_withoutcomes$distance_p20 <- as.ordered(cut2(patients_clean5_postmatch_withoutcomes$distance, g=5))
+
+patients_clean5_postmatch_withoutcomes_quint1 <- patients_clean5_postmatch_withoutcomes %>% filter(distance < 0.0722)
+patients_clean5_postmatch_withoutcomes_quint2 <- patients_clean5_postmatch_withoutcomes %>% filter(distance >= 0.0722 & distance < 0.1748)
+patients_clean5_postmatch_withoutcomes_quint3 <- patients_clean5_postmatch_withoutcomes %>% filter(distance >= 0.1748 & distance < 0.3194)
+patients_clean5_postmatch_withoutcomes_quint4 <- patients_clean5_postmatch_withoutcomes %>% filter(distance >= 0.3194 & distance < 0.5036)
+patients_clean5_postmatch_withoutcomes_quint5 <- patients_clean5_postmatch_withoutcomes %>% filter(distance >= 0.5036)
+
+
+## Run analyses
+
+log_mort30_match_quint1 <- glm(postmort30 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_quint1, family = "binomial")
+log_mort30_match_quint2 <- glm(postmort30 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_quint2, family = "binomial")
+log_mort30_match_quint3 <- glm(postmort30 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_quint3, family = "binomial")
+log_mort30_match_quint4 <- glm(postmort30 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_quint4, family = "binomial")
+log_mort30_match_quint5 <- glm(postmort30 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_quint5, family = "binomial")
+
+log_mort60_match_quint1 <- glm(postmort60 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_quint1, family = "binomial")
+log_mort60_match_quint2 <- glm(postmort60 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_quint2, family = "binomial")
+log_mort60_match_quint3 <- glm(postmort60 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_quint3, family = "binomial")
+log_mort60_match_quint4 <- glm(postmort60 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_quint4, family = "binomial")
+log_mort60_match_quint5 <- glm(postmort60 ~ icu_adm, data = patients_clean5_postmatch_withoutcomes_quint5, family = "binomial")
+
+tab_model(log_mort30_match_quint1, log_mort30_match_quint2, log_mort30_match_quint3, log_mort30_match_quint4,
+          log_mort30_match_quint5)
+
+tab_model(log_mort60_match_quint1, log_mort60_match_quint2, log_mort60_match_quint3, log_mort60_match_quint4,
+          log_mort60_match_quint5)
+
+```
+
+
+
+
+
+
+
